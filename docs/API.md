@@ -1,0 +1,109 @@
+# REST API 명세(요약)
+
+## 공통
+- Base: `http://localhost:PORT`
+- 인증: 로컬 기본(무), 외부 호출시 프로파일 토큰 사용.
+- 스트리밍: `/chat` SSE.
+
+## POST /chat (SSE)
+- 요청: `{ messages:[{role,content}], model?, stream?, temperature?, projectID?, retrieval?:{k} }`
+- 응답:
+  - `stream=true`: SSE `event: token` + `data: <text>`, 마지막 `event: done`
+  - `stream=false`: `{ content: string }`
+  - 동작: `projectID`가 있으면 RAG 검색 결과를 시스템 컨텍스트로 주입하여 인용 가능한 답변 유도
+
+## POST /edits/plan
+- 요청: `{ goal:string, files?:string[], projectID }`
+- 응답: `{ plan:[{step,reason,targets}], confidence }`
+
+## POST /edits/apply
+- 요청: `{ patches:[{path,hunks[]}], projectID, runHooks?:boolean }`
+- 응답: `{ status:"ok|failed", diffSummary, hooks:{fmt,lint,test}, logsRef }`
+
+## POST /index/run
+- 요청: `{ projectID, mode:"full|incremental" }`
+- 응답: `{ jobID }`; `GET /index/jobs/:id` → `{ status, stats }`
+
+## POST /knowledge
+- 요청: `{ projectID, sourceType:"code|doc|web", pathOrURL?, title?, text, trustScore?, pinned? }`
+- 응답: `Knowledge`
+
+## GET /knowledge
+- 쿼리: `?projectID=<id>&minScore=0`
+- 응답: `Knowledge[]`
+
+## POST /knowledge/vet
+- 요청: `{ projectID }`
+- 응답: `{ updated: number }` (검증/점수화 배치 결과)
+
+## POST /knowledge/promote
+- 요청: `{ projectID, title, text, pathOrURL?, commitSHA?, files?:string[], symbols?:string[], pin?:boolean }`
+- 응답: `Knowledge` (승격된 항목)
+
+## POST /knowledge/promote/auto
+- 설명: 주어진 파일 목록을 요약(LLM 사용 가능)하여 Knowledge 자동 생성
+- 요청: `{ projectID, files:string[], title?:string, pin?:boolean }`
+- 응답: `Knowledge`
+
+## POST /knowledge/reverify
+- 요청: `{ projectID }`
+- 응답: `{ updated: number }`
+
+## POST /knowledge/gc
+- 요청: `{ projectID, minScore?: number }`
+- 응답: `{ removed: number }`
+
+## GET /search
+- 쿼리: `?q=...&k=10&mode=hybrid`
+- 응답: `{ results:[{chunkID, path, score, startLine, endLine, preview, source}], tookMs }`
+
+## GET/POST /projects
+- 생성: `{ name, rootPath, ignore?:string[] }` → `{ projectID }`
+
+## POST /tools/hooks
+- 요청: `{ projectID, targets?:string[] }`
+- 응답: `{ fmt:{ok,output}, lint:{ok,output}, test:{ok,output} }`
+
+## 헬스/메트릭
+- `GET /healthz` → `200 OK`
+- `GET /metrics` → JSON 카운터 `{ projects, documents, jobs }`
+- 백그라운드 큐레이터(옵션): 서버 기동 시 지식 재검증/정리 배치가 주기적으로 실행(`MYCODER_CURATOR_DISABLE`로 비활성화, `MYCODER_CURATOR_INTERVAL`, `MYCODER_KNOWLEDGE_MIN_TRUST`로 파라미터 제어)
+
+## 파일시스템 API
+- 보안: 기본적으로 프로젝트 루트 내부만 허용. 외부 경로 접근은 정책/플래그 필요.
+
+### POST /fs/read
+- 요청: `{ projectID, path }`
+- 응답: `{ path, content, sha }`
+
+### POST /fs/write
+- 요청: `{ projectID, path, content, createIfMissing?:boolean, overwrite?:boolean }`
+- 응답: `{ path, sha }`
+
+### POST /fs/patch
+- 요청: `{ projectID, path, hunks:[{start,length,replace}] }`
+- 응답: `{ ok:true }`
+
+### POST /fs/delete
+- 요청: `{ projectID, path }`
+- 응답: `{ ok:true }`
+
+## 터미널 실행 API
+- 스트리밍: SSE. 시간/메모리/출력 제한, 허용/차단 목록.
+
+### POST /shell/exec (SSE)
+- 요청: `{ projectID, cmd:string, args?:string[], cwd?:string, env?:{[k:string]:string}, timeoutSec?:number, interactive?:boolean }`
+- 이벤트: `stdout|stderr|exit|error` (구조화 페이로드 포함)
+ - 실행 셸: zsh 기본(`/bin/zsh -lc`로 실행), `cmd`와 `args`를 쉘 커맨드라인으로 결합
+
+### POST /shell/exec/stream
+- 설명: 단순 SSE 스트림(조합 출력). 요청 본문은 `/shell/exec`와 동일.
+- 이벤트: `stdout`, `stderr`, 마지막 `exit` 이벤트에 종료코드 포함.
+
+## MCP 연동 API(옵션)
+### GET /mcp/tools
+- 응답: `{ tools:[{name,description,paramsSchema}...] }`
+
+### POST /mcp/call
+- 요청: `{ tool:string, params:any }`
+- 응답: `{ result:any, logs?:string }`
