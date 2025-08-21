@@ -24,9 +24,12 @@
 - `mycoder knowledge promote-auto --project <id> --files "path/a.go,path/b.go" [--title ...] [--pin]`: 코드 파일 요약 후 자동 승격
 
 ## 파일/터미널/MCP
-- `mycoder exec -- -- <cmd> [args...]` : 터미널 명령 실행(기본 비스트리밍, `--project`, `--timeout` 지원).
+- `mycoder exec -- -- <cmd> [args...]` : 터미널 명령 실행(기본 비스트리밍, `--project`, `--timeout`, `--cwd`, `--env` 지원).
+  - 출력 제한(비스트리밍): `--tail N`(마지막 N라인만), `--max-bytes N`(마지막 N바이트만)
   - 스트리밍: `mycoder exec --project <id> --stream -- -- <cmd> [args...]` (SSE: `stdout|stderr|exit`)
+    - 스트리밍 요약: `--stream-tail N` 사용 시 종료 후 마지막 N라인만 출력
 - `mycoder fs read|write|patch|delete --project <id> --path <p> [--content ...] [--start N --length N --replace ...]` : 프로젝트 루트 내 파일 조작.
+  - 안전장치: `--dry-run`(미리보기), `--yes` 없으면 적용 거부(write/delete/patch)
 - `mycoder mcp tools` / `mycoder mcp call <tool> --json '<params>'` : MCP 도구 조회/호출.
 
 ## 공통 규칙

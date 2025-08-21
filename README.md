@@ -87,9 +87,11 @@ make hook-install
 - 메트릭: `mycoder metrics` (Prometheus 텍스트 기본, `?format=json` 지원)
 - 훅 실행: `mycoder hooks run --project <id> [--targets ...] [--timeout 60] [--verbose]`
   - 서버 API: `POST /tools/hooks` (`env` 화이트리스트 지원: `GOFLAGS` 등)
-- 파일/FS: `mycoder fs read|write|patch|delete --project <id> --path <p> [--content ...] [--start N --length N --replace ...]`
- - 터미널 실행: `mycoder exec --project <id> -- -- <cmd> [args...]` (비스트리밍, 타임아웃 지원)
+ - 파일/FS: `mycoder fs read|write|patch|delete --project <id> --path <p> [--content ...] [--start N --length N --replace ...]`
+   - 안전장치: `--dry-run`으로 미리보기, `--yes` 없으면 적용 거부(write/delete/patch)
+ - 터미널 실행: `mycoder exec --project <id> -- -- <cmd> [args...]` (비스트리밍, 타임아웃/작업디렉토리/환경 전달 지원)
    - 스트리밍: `mycoder exec --project <id> --stream -- -- <cmd> [args...]` (SSE: stdout/stderr/exit)
+   - 출력 제한: 비스트리밍 `--tail N`, `--max-bytes N`; 스트리밍 `--stream-tail N`
 
 지식(knowledge) 명령
 - 추가: `mycoder knowledge add --project <id> --type <code|doc|web> --text "..." [--title ...] [--url ...] [--trust 0.0] [--pin]`

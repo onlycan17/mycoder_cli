@@ -452,6 +452,44 @@ func toJSONStringArray(csv string) string {
 	return strings.Join(parts, ",")
 }
 
+func parseEnvCSV(csv string) map[string]string {
+	m := make(map[string]string)
+	if strings.TrimSpace(csv) == "" {
+		return m
+	}
+	parts := strings.Split(csv, ",")
+	for _, p := range parts {
+		kv := strings.SplitN(strings.TrimSpace(p), "=", 2)
+		if len(kv) == 2 {
+			m[kv[0]] = kv[1]
+		}
+	}
+	return m
+}
+
+func tailLines(s string, n int) string {
+	if n <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	// preserve trailing newline behavior
+	tail := lines[len(lines)-n:]
+	return strings.Join(tail, "\n")
+}
+
+func tailBytes(s string, max int) string {
+	if max <= 0 {
+		return s
+	}
+	if len(s) <= max {
+		return s
+	}
+	return s[len(s)-max:]
+}
+
 func fsCmd(args []string) {
 	if len(args) == 0 {
 		fmt.Println("usage: mycoder fs [read|write|delete|patch] --project <id> --path <p> [--content ...] [--start N --length N --replace ...]")
@@ -481,9 +519,19 @@ func fsCmd(args []string) {
 		project := fs.String("project", "", "project ID")
 		path := fs.String("path", "", "path")
 		content := fs.String("content", "", "content")
+		dryRun := fs.Bool("dry-run", false, "print what would change and exit")
+		yes := fs.Bool("yes", false, "apply without prompt (required unless --dry-run)")
 		_ = fs.Parse(args[1:])
 		if *project == "" || *path == "" {
 			fmt.Println("--project and --path required")
+			os.Exit(1)
+		}
+		if *dryRun {
+			fmt.Printf("[dry-run] write %s (len=%d)\n", *path, len(*content))
+			return
+		}
+		if !*yes {
+			fmt.Println("confirmation required: pass --yes to apply or use --dry-run")
 			os.Exit(1)
 		}
 		body := fmt.Sprintf(`{"projectID":"%s","path":"%s","content":%q}`, *project, *path, *content)
@@ -498,9 +546,19 @@ func fsCmd(args []string) {
 		fs := flag.NewFlagSet("fs delete", flag.ExitOnError)
 		project := fs.String("project", "", "project ID")
 		path := fs.String("path", "", "path")
+		dryRun := fs.Bool("dry-run", false, "print what would change and exit")
+		yes := fs.Bool("yes", false, "apply without prompt (required unless --dry-run)")
 		_ = fs.Parse(args[1:])
 		if *project == "" || *path == "" {
 			fmt.Println("--project and --path required")
+			os.Exit(1)
+		}
+		if *dryRun {
+			fmt.Printf("[dry-run] delete %s\n", *path)
+			return
+		}
+		if !*yes {
+			fmt.Println("confirmation required: pass --yes to apply or use --dry-run")
 			os.Exit(1)
 		}
 		body := fmt.Sprintf(`{"projectID":"%s","path":"%s"}`, *project, *path)
@@ -518,9 +576,19 @@ func fsCmd(args []string) {
 		start := fs.Int("start", 0, "byte start")
 		length := fs.Int("length", 0, "byte length")
 		replace := fs.String("replace", "", "replacement text")
+		dryRun := fs.Bool("dry-run", false, "print what would change and exit")
+		yes := fs.Bool("yes", false, "apply without prompt (required unless --dry-run)")
 		_ = fs.Parse(args[1:])
 		if *project == "" || *path == "" {
 			fmt.Println("--project and --path required")
+			os.Exit(1)
+		}
+		if *dryRun {
+			fmt.Printf("[dry-run] patch %s start=%d length=%d replace_len=%d\n", *path, *start, *length, len(*replace))
+			return
+		}
+		if !*yes {
+			fmt.Println("confirmation required: pass --yes to apply or use --dry-run")
 			os.Exit(1)
 		}
 		body := fmt.Sprintf(`{"projectID":"%s","path":"%s","hunks":[{"start":%d,"length":%d,"replace":%q}]}`, *project, *path, *start, *length, *replace)
@@ -542,6 +610,11 @@ func execCmd(args []string) {
 	project := fs.String("project", "", "project ID")
 	timeout := fs.Int("timeout", 30, "timeout in seconds")
 	stream := fs.Bool("stream", false, "stream output (SSE)")
+	cwd := fs.String("cwd", "", "working directory relative to project root")
+	envCSV := fs.String("env", "", "comma-separated K=V pairs to pass (whitelist)")
+	tail := fs.Int("tail", 0, "print only the last N lines (non-stream)")
+	maxBytes := fs.Int("max-bytes", 0, "limit printed bytes to N (non-stream)")
+	streamTail := fs.Int("stream-tail", 0, "buffer and print only last N lines at end (stream)")
 	_ = fs.Parse(args)
 	rest := fs.Args()
 	if *project == "" || len(rest) == 0 {
@@ -555,11 +628,13 @@ func execCmd(args []string) {
 	}
 	// build JSON body
 	body := struct {
-		ProjectID string   `json:"projectID"`
-		Cmd       string   `json:"cmd"`
-		Args      []string `json:"args"`
-		Timeout   int      `json:"timeoutSec"`
-	}{ProjectID: *project, Cmd: cmd, Args: argv, Timeout: *timeout}
+		ProjectID string            `json:"projectID"`
+		Cmd       string            `json:"cmd"`
+		Args      []string          `json:"args"`
+		Timeout   int               `json:"timeoutSec"`
+		Cwd       string            `json:"cwd"`
+		Env       map[string]string `json:"env"`
+	}{ProjectID: *project, Cmd: cmd, Args: argv, Timeout: *timeout, Cwd: *cwd, Env: parseEnvCSV(*envCSV)}
 	b, _ := json.Marshal(body)
 	if *stream {
 		req, _ := http.NewRequest(http.MethodPost, serverURL()+"/shell/exec/stream", strings.NewReader(string(b)))
@@ -573,6 +648,18 @@ func execCmd(args []string) {
 		rd := bufio.NewScanner(resp.Body)
 		lastEvent := ""
 		exitCode := 0
+		limited := false
+		// optional tail buffers
+		var bufOut, bufErr []string
+		push := func(buf *[]string, line string, max int) {
+			if max <= 0 {
+				return
+			}
+			*buf = append(*buf, line)
+			if len(*buf) > max {
+				*buf = (*buf)[len(*buf)-max:]
+			}
+		}
 		for rd.Scan() {
 			line := rd.Text()
 			if strings.HasPrefix(line, "event:") {
@@ -583,11 +670,38 @@ func execCmd(args []string) {
 				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 				switch lastEvent {
 				case "stdout":
-					fmt.Println(data)
+					if *streamTail > 0 {
+						push(&bufOut, data, *streamTail)
+					} else {
+						fmt.Println(data)
+					}
 				case "stderr":
-					fmt.Fprintln(os.Stderr, data)
+					if *streamTail > 0 {
+						push(&bufErr, data, *streamTail)
+					} else {
+						fmt.Fprintln(os.Stderr, data)
+					}
 				case "exit":
 					fmt.Sscanf(data, "%d", &exitCode)
+				case "limit":
+					limited = true
+				}
+			}
+		}
+		if *streamTail > 0 {
+			if limited {
+				fmt.Fprintln(os.Stderr, "[limit] output truncated by server")
+			}
+			if len(bufOut) > 0 {
+				fmt.Fprintf(os.Stdout, "---- stdout (last %d lines) ----\n", len(bufOut))
+				for _, l := range bufOut {
+					fmt.Println(l)
+				}
+			}
+			if len(bufErr) > 0 {
+				fmt.Fprintf(os.Stderr, "---- stderr (last %d lines) ----\n", len(bufErr))
+				for _, l := range bufErr {
+					fmt.Fprintln(os.Stderr, l)
 				}
 			}
 		}
@@ -603,14 +717,25 @@ func execCmd(args []string) {
 	}
 	defer resp.Body.Close()
 	var res struct {
-		ExitCode int    `json:"exitCode"`
-		Output   string `json:"output"`
+		ExitCode  int    `json:"exitCode"`
+		Output    string `json:"output"`
+		Truncated bool   `json:"truncated"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		_, _ = io.Copy(os.Stdout, resp.Body)
 		return
 	}
-	fmt.Print(res.Output)
+	out := res.Output
+	if *tail > 0 {
+		out = tailLines(out, *tail)
+	}
+	if *maxBytes > 0 {
+		out = tailBytes(out, *maxBytes)
+	}
+	fmt.Print(out)
+	if res.Truncated {
+		fmt.Fprintln(os.Stderr, "[limit] output truncated by server")
+	}
 	if res.ExitCode != 0 {
 		os.Exit(res.ExitCode)
 	}

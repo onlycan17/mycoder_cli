@@ -164,7 +164,7 @@
   - [ ] `mycoder explain`, `mycoder edit`, `mycoder test`
 - 중분류: 파일/쉘/MCP 명령
   - [x] `mycoder fs read|write|patch|delete`
-  - [ ] `mycoder fs` 옵션: `--dry-run`/`--yes`
+  - [x] `mycoder fs` 옵션: `--dry-run`/`--yes`
   - [x] `mycoder exec -- cmd [args...]`(+ `--timeout`)
   - [x] `mycoder exec --stream`(SSE 소비)
   - [ ] `mycoder exec` 옵션: `--cwd`/`--env`

@@ -61,6 +61,33 @@ type API struct {
 
 func NewAPI(s Store, p llm.ChatProvider) *API { return &API{store: s, llm: p} }
 
+// capBuffer captures writes up to a fixed limit and marks truncation beyond it.
+type capBuffer struct {
+	b         []byte
+	n         int
+	cap       int
+	truncated bool
+}
+
+func newCapBuffer(limit int) *capBuffer { return &capBuffer{b: make([]byte, 0, limit), cap: limit} }
+
+func (c *capBuffer) Write(p []byte) (int, error) {
+	remain := c.cap - c.n
+	if remain > 0 {
+		if len(p) <= remain {
+			c.b = append(c.b, p...)
+			c.n += len(p)
+		} else {
+			c.b = append(c.b, p[:remain]...)
+			c.n += remain
+			c.truncated = true
+		}
+	} else {
+		c.truncated = true
+	}
+	return len(p), nil
+}
+
 // lightweight in-process metrics collector
 type metricsCollector struct {
 	mu sync.Mutex
@@ -881,6 +908,8 @@ func (a *API) handleShellExec(w http.ResponseWriter, r *http.Request) {
 		ProjectID, Cmd string
 		Args           []string
 		TimeoutSec     int
+		Cwd            string            `json:"cwd"`
+		Env            map[string]string `json:"env"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" || req.Cmd == "" {
 		http.Error(w, "invalid json", http.StatusBadRequest)
@@ -900,8 +929,28 @@ func (a *API) handleShellExec(w http.ResponseWriter, r *http.Request) {
 	// Build a zsh -lc commandline so users can use shell semantics.
 	cmdline := buildCmdline(req.Cmd, req.Args)
 	cmd := exec.CommandContext(ctx, "/bin/zsh", "-lc", cmdline)
-	cmd.Dir = p.RootPath
-	out, err := cmd.CombinedOutput()
+	// resolve cwd under project root if provided
+	workdir := p.RootPath
+	if strings.TrimSpace(req.Cwd) != "" {
+		_, full, ok := a.resolveProjectPath(p.ID, req.Cwd)
+		if ok {
+			workdir = full
+		}
+	}
+	cmd.Dir = workdir
+	// whitelist env pass-through
+	allowed := map[string]bool{"GOFLAGS": true, "GOWORK": true, "CGO_ENABLED": true}
+	env := os.Environ()
+	for k, v := range req.Env {
+		if allowed[k] {
+			env = append(env, fmt.Sprintf("%s=%s", k, v))
+		}
+	}
+	cmd.Env = env
+	cb := newCapBuffer(64 * 1024)
+	cmd.Stdout = cb
+	cmd.Stderr = cb
+	err := cmd.Run()
 	exit := 0
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
@@ -910,7 +959,7 @@ func (a *API) handleShellExec(w http.ResponseWriter, r *http.Request) {
 			exit = -1
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"exitCode": exit, "output": string(out)})
+	writeJSON(w, http.StatusOK, map[string]any{"exitCode": exit, "output": string(cb.b), "truncated": cb.truncated})
 }
 
 func (a *API) handleShellExecStream(w http.ResponseWriter, r *http.Request) {
@@ -922,6 +971,8 @@ func (a *API) handleShellExecStream(w http.ResponseWriter, r *http.Request) {
 		ProjectID, Cmd string
 		Args           []string
 		TimeoutSec     int
+		Cwd            string            `json:"cwd"`
+		Env            map[string]string `json:"env"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" || req.Cmd == "" {
 		http.Error(w, "invalid json", http.StatusBadRequest)
@@ -940,7 +991,22 @@ func (a *API) handleShellExecStream(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	cmdline := buildCmdline(req.Cmd, req.Args)
 	cmd := exec.CommandContext(ctx, "/bin/zsh", "-lc", cmdline)
-	cmd.Dir = p.RootPath
+	workdir := p.RootPath
+	if strings.TrimSpace(req.Cwd) != "" {
+		_, full, ok := a.resolveProjectPath(p.ID, req.Cwd)
+		if ok {
+			workdir = full
+		}
+	}
+	cmd.Dir = workdir
+	allowed := map[string]bool{"GOFLAGS": true, "GOWORK": true, "CGO_ENABLED": true}
+	env := os.Environ()
+	for k, v := range req.Env {
+		if allowed[k] {
+			env = append(env, fmt.Sprintf("%s=%s", k, v))
+		}
+	}
+	cmd.Env = env
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 	if err := cmd.Start(); err != nil {
@@ -957,8 +1023,42 @@ func (a *API) handleShellExecStream(w http.ResponseWriter, r *http.Request) {
 			fl.Flush()
 		}
 	}
-	go streamReader(stdout, func(line string) { send("stdout", line) })
-	go streamReader(stderr, func(line string) { send("stderr", line) })
+	// streaming output limit (64KiB) across stdout/stderr
+	var mu sync.Mutex
+	limit := 64 * 1024
+	sent := 0
+	limited := false
+	sendWithLimit := func(kind, data string) {
+		mu.Lock()
+		if limited {
+			mu.Unlock()
+			return
+		}
+		if kind == "stdout" || kind == "stderr" {
+			remain := limit - sent
+			if remain <= 0 {
+				limited = true
+				mu.Unlock()
+				send("limit", "output truncated")
+				cancel()
+				return
+			}
+			if len(data) > remain {
+				part := data[:remain]
+				sent += len(part)
+				mu.Unlock()
+				send(kind, part)
+				send("limit", "output truncated")
+				cancel()
+				return
+			}
+			sent += len(data)
+		}
+		mu.Unlock()
+		send(kind, data)
+	}
+	go streamReader(stdout, func(line string) { sendWithLimit("stdout", line) })
+	go streamReader(stderr, func(line string) { sendWithLimit("stderr", line) })
 	err := cmd.Wait()
 	code := 0
 	if err != nil {

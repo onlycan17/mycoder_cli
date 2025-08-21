@@ -95,10 +95,15 @@
 ## 터미널 실행 API
 - 스트리밍: SSE. 시간/메모리/출력 제한, 허용/차단 목록.
 
-### POST /shell/exec (SSE)
-- 요청: `{ projectID, cmd:string, args?:string[], cwd?:string, env?:{[k:string]:string}, timeoutSec?:number, interactive?:boolean }`
-- 이벤트: `stdout|stderr|exit|error` (구조화 페이로드 포함)
- - 실행 셸: zsh 기본(`/bin/zsh -lc`로 실행), `cmd`와 `args`를 쉘 커맨드라인으로 결합
+### POST /shell/exec (비스트리밍)
+- 요청: `{ projectID, cmd:string, args?:string[], cwd?:string, env?:{[k:string]:string}, timeoutSec?:number }`
+- 응답: `{ exitCode:number, output:string, truncated?:boolean }` (output은 안전을 위해 기본 64KiB로 캡)
+- 실행 셸: zsh(`/bin/zsh -lc`)로 실행. `cwd`는 프로젝트 루트 하위만 허용, `env`는 화이트리스트 키만 반영(`GOFLAGS`,`GOWORK`,`CGO_ENABLED`).
+
+### POST /shell/exec/stream (SSE)
+- 요청: `{ projectID, cmd:string, args?:string[], cwd?:string, env?:{[k:string]:string}, timeoutSec?:number }`
+- 이벤트: `stdout`, `stderr`, 마지막 `exit` 이벤트에 종료코드 문자열 포함
+- 실행 셸/보안 규칙은 `/shell/exec`와 동일
 
 ### POST /shell/exec/stream
 - 설명: 단순 SSE 스트림(조합 출력). 요청 본문은 `/shell/exec`와 동일.
