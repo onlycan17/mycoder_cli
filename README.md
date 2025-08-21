@@ -4,6 +4,7 @@ mycoder는 로컬/사내 코드베이스를 색인하고 검색·질의(RAG)하�
 
 ## TL;DR (빠른 시작)
 - 빌드: `make build`
+ - 전역 설치: `make install` 후 `mycoder` 바로 실행 가능
 - 서버 실행: `./bin/mycoder serve --addr :8089`
 - 프로젝트 생성: `mycoder projects create --name demo --root .`
 - 인덱싱: `mycoder index --project <id> --mode full`
@@ -59,7 +60,7 @@ make hook-install
 - 커밋 전 자동으로 `make fmt && make fmt-check && make test && make lint`를 실행합니다
 - 포맷팅 변경은 자동 스테이징되어 커밋 일관성을 보장합니다
 
-## 설정(환경 변수)
+## 설정(환경 변수/설정 파일)
 - `MYCODER_SERVER_URL`: CLI가 붙을 서버 주소(기본 `http://localhost:8089`)
 - `MYCODER_SQLITE_PATH`: SQLite 파일 경로 지정 시 영구 저장(미지정 시 메모리)
 - `MYCODER_LLM_PROVIDER`: `openai`(기본)
@@ -89,12 +90,27 @@ make hook-install
    - 옵션: `--json`(JSON pretty), `--color`(텍스트 키 컬러)
 - 훅 실행: `mycoder hooks run --project <id> [--targets ...] [--timeout 60] [--verbose]`
   - 서버 API: `POST /tools/hooks` (`env` 화이트리스트 지원: `GOFLAGS` 등)
+- 테스트만 실행: `mycoder test --project <id> [--timeout 60] [--verbose]`
  - 파일/FS: `mycoder fs read|write|patch|delete --project <id> --path <p> [--content ...] [--start N --length N --replace ...]`
    - 안전장치: `--dry-run`으로 미리보기, `--yes` 없으면 적용 거부(write/delete/patch)
    - 대량 변경 감지: `--large-threshold-bytes` 초과 시 차단, `--allow-large`로 우회
- - 터미널 실행: `mycoder exec --project <id> -- -- <cmd> [args...]` (비스트리밍, 타임아웃/작업디렉토리/환경 전달 지원)
+- 터미널 실행: `mycoder exec --project <id> -- -- <cmd> [args...]` (비스트리밍, 타임아웃/작업디렉토리/환경 전달 지원)
    - 스트리밍: `mycoder exec --project <id> --stream -- -- <cmd> [args...]` (SSE: stdout/stderr/exit)
    - 출력 제한: 비스트리밍 `--tail N`, `--max-bytes N`; 스트리밍 `--stream-tail N`
+
+### 간편 실행: `mycoder`
+- 전역 설치: `make install` (기본 설치 경로: `$HOME/.mycoder/bin/mycoder`)
+  - 제거: `make uninstall`
+- PATH 설정(처음 1회 권장):
+  - 설치 완료 후 자동으로 PATH 설정 힌트가 출력됩니다.
+  - 수동 설정: `echo 'export PATH="$HOME/.mycoder/bin:$PATH"' >> ~/.bashrc` (또는 `~/.zshrc`), 이후 새 셸 또는 `source ~/.bashrc`
+  - 언제든지 힌트 재출력: `make print-path-hint`
+- 동작 확인: `make smoke`
+  - PATH에 설치된 `mycoder` 확인(`which`, `version`) 후 로컬 서버를 기동해 `/healthz` 헬스체크까지 수행
+  - 임의 포트 사용: `make smoke PORT=8090`
+- 수동 설치/대안:
+  - 심볼릭 링크: `ln -sf "$(pwd)/bin/mycoder" "$HOME/.mycoder/bin/mycoder"`
+  - 다른 경로로 설치하고 싶다면: `make install PREFIX=$HOME/custom/mc`
 
 지식(knowledge) 명령
 - 추가: `mycoder knowledge add --project <id> --type <code|doc|web> --text "..." [--title ...] [--url ...] [--trust 0.0] [--pin]`
@@ -126,6 +142,12 @@ make hook-install
 - 빌드 정보
   - `mycoder_build_info{version,commit} 1`
 - JSON 포맷 필요 시 `GET /metrics?format=json`
+
+## 로그(관측)
+- JSON 라인 포맷으로 표준에러(stderr)에 구조화 로그를 출력합니다.
+- 레벨: `MYCODER_LOG_LEVEL=debug|info|warn|error` (기본 `info`)
+- 요청 로그: `http.req` 이벤트로 메소드/경로/상태/지연/바이트를 기록합니다.
+- 민감정보 마스킹: 키/값에 비밀로 추정되는 문자열(`key|token|secret|password|bearer|sk-...`)은 자동 마스킹됩니다.
 
 ## 개발 가이드
 - 게이트(차단 규칙): `make fmt && make fmt-check && make test && make lint`
@@ -243,3 +265,29 @@ $ mycoder chat --project $PID "요약해줘: internal/server/server.go 변경 �
 
 ---
 의견/기여 환영합니다. 문제나 제안은 이슈로 남겨주세요.
+### 설정 파일
+- 경로: `~/.mycoder/config.yaml` (또는 `config.yml`, `config.json`)
+- 환경변수가 우선이며, 설정 파일의 값은 비어있는 환경변수에만 적용됩니다.
+- 예시(YAML, 평면 키:값):
+  ```yaml
+  MYCODER_SERVER_URL: http://localhost:8089
+  MYCODER_OPENAI_BASE_URL: http://localhost:1234/v1
+  MYCODER_OPENAI_API_KEY: ""
+  MYCODER_CHAT_MODEL: gpt-3.5-turbo
+  MYCODER_EMBEDDING_MODEL: text-embedding-3-small
+  MYCODER_SQLITE_PATH: /path/to/mycoder.db
+  MYCODER_SHELL_DENY_REGEX: (?i)rm\s+-rf
+  MYCODER_FS_ALLOW_REGEX: ^(internal/|cmd/)
+  MYCODER_CURATOR_INTERVAL: 10m
+  MYCODER_KNOWLEDGE_MIN_TRUST: 0.4
+  ```
+
+### 데이터베이스 마이그레이션/시드
+- SQLite 사용 시 앱이 자동으로 스키마 버전을 관리합니다.
+- 롤백은 일부 버전에 한해 지원됩니다(신규 테이블 삭제 등). 컬럼 삭제는 미지원입니다.
+- 시드 데이터: `MYCODER_DB_SEED=true` 설정 시 프로젝트가 비어있을 경우 `demo` 프로젝트를 자동 생성합니다.
+- `MYCODER_LOG_LEVEL`: `debug|info|warn|error` (기본 `info`)
+### 벡터 스토어 설정(옵션)
+- `MYCODER_VECTOR_PROVIDER`: `noop`(기본) | `pgvector`
+- `MYCODER_PGVECTOR_DSN`: pgvector 연결 문자열 (예: `postgres://user:pass@host:5432/db?sslmode=disable`)
+- 현재 버전에서는 pgvector 어댑터가 스텁 상태이므로, 실제 KNN 검색은 추후 통합 예정입니다.

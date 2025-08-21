@@ -18,8 +18,11 @@
 
 ## 4. 검색(Retrieve)
 - 하이브리드: BM25 상위 K ∪ 벡터 상위 K → LLM 리랭커로 최종 N.
-- 쿼리 플래닝: 의도(탐색/설명/편집/수정/리서치) 분류 → 증거 컨텍스트 구성 규칙 차등 적용.
-- 멀티홉: 심볼 그래프 확장(정의 → 참조/사용처).
+  - 인터페이스: `internal/rag/retriever.Retriever` (`Retrieve(ctx, projectID, query, k)`)
+  - 기본 구현: BM25(FTS5) 기반 `BM25Retriever` — 저장소의 `Search(projectID, query, k)`를 위임 호출
+  - 하이브리드 구현: `HybridRetriever` — BM25와 KNN 결과를 합집합으로 병합 후 `score = bm25 + α·knn`으로 재정렬(중복 경로는 상위 스코어의 범위를 유지). `α`는 `MYCODER_HYBRID_ALPHA`(기본 0.5)로 조정 가능
+  - 쿼리 플래닝: 의도(탐색/설명/편집/수정/리서치) 분류 → 증거 컨텍스트 구성 규칙 차등 적용.
+  - 멀티홉: 심볼 그래프 확장(정의 → 참조/사용처).
  - 지식 결합: Knowledge에서 trustScore 상위 항목을 우선 컨텍스트로 주입.
 
 ## 5. 답변 합성(Compose)

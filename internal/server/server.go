@@ -23,6 +23,7 @@ import (
 	"mycoder/internal/indexer"
 	"mycoder/internal/llm"
 	oai "mycoder/internal/llm/openai"
+	mylog "mycoder/internal/log"
 	"mycoder/internal/models"
 	"mycoder/internal/store"
 	"mycoder/internal/version"
@@ -52,7 +53,7 @@ type Store interface {
 }
 
 type IncrementalStore interface {
-	UpsertDocument(projectID, path, content, sha, lang string) *models.Document
+	UpsertDocument(projectID, path, content, sha, lang, mtime string) *models.Document
 	PruneDocuments(projectID string, present []string) error
 }
 
@@ -121,6 +122,46 @@ func shellAllowed(cmdline string) (bool, string) {
 	}
 	if allowRe != nil && !allowRe.MatchString(cmdline) {
 		return false, "command not allowed by policy"
+	}
+	return true, ""
+}
+
+// FS policy (allow/deny regex) on relative path
+var (
+	fsPolicyOnce sync.Once
+	fsAllowRe    *regexp.Regexp
+	fsDenyRe     *regexp.Regexp
+)
+
+func loadFSPolicy() {
+	fsPolicyOnce.Do(func() {
+		if v := os.Getenv("MYCODER_FS_ALLOW_REGEX"); v != "" {
+			fsAllowRe, _ = regexp.Compile(v)
+		}
+		if v := os.Getenv("MYCODER_FS_DENY_REGEX"); v != "" {
+			fsDenyRe, _ = regexp.Compile(v)
+		}
+	})
+}
+
+func fsAllowed(rel string) (bool, string) {
+	loadFSPolicy()
+	// Late-binding for tests/env changes: re-read if unset
+	if fsAllowRe == nil {
+		if v := os.Getenv("MYCODER_FS_ALLOW_REGEX"); v != "" {
+			fsAllowRe, _ = regexp.Compile(v)
+		}
+	}
+	if fsDenyRe == nil {
+		if v := os.Getenv("MYCODER_FS_DENY_REGEX"); v != "" {
+			fsDenyRe, _ = regexp.Compile(v)
+		}
+	}
+	if fsDenyRe != nil && fsDenyRe.MatchString(rel) {
+		return false, "fs path denied by policy"
+	}
+	if fsAllowRe != nil && !fsAllowRe.MatchString(rel) {
+		return false, "fs path not allowed by policy"
 	}
 	return true, ""
 }
@@ -312,7 +353,14 @@ func logMiddleware(next http.Handler) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(rec, r)
 		dur := time.Since(start)
-		fmt.Fprintf(os.Stdout, "%s %s %s %d\n", r.Method, r.URL.Path, dur, rec.status)
+		lg := mylog.New()
+		lg.Info("http.req",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", rec.status,
+			"duration_ms", int(dur/time.Millisecond),
+			"bytes", rec.nbytes,
+		)
 		// metrics: requests and durations (with label normalization + sampling)
 		if shouldSample() {
 			path := normalizePath(r.URL.Path)
@@ -406,7 +454,7 @@ func (a *API) handleIndexRun(w http.ResponseWriter, r *http.Request) {
 			if inc, ok := a.store.(IncrementalStore); ok {
 				present := make([]string, 0, len(docs))
 				for _, d := range docs {
-					inc.UpsertDocument(p.ID, d.Path, d.Content, d.SHA, d.Lang)
+					inc.UpsertDocument(p.ID, d.Path, d.Content, d.SHA, d.Lang, d.MTime)
 					present = append(present, d.Path)
 				}
 				_ = inc.PruneDocuments(p.ID, present)
@@ -504,7 +552,7 @@ func (a *API) handleIndexRunStream(w http.ResponseWriter, r *http.Request) {
 			if reqCtx.Err() != nil {
 				return
 			}
-			inc.UpsertDocument(p.ID, d.Path, d.Content, d.SHA, d.Lang)
+			inc.UpsertDocument(p.ID, d.Path, d.Content, d.SHA, d.Lang, d.MTime)
 			present = append(present, d.Path)
 			ingested++
 			if ingested%10 == 0 || ingested == total {
@@ -1024,6 +1072,10 @@ func (a *API) handleFSWrite(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "path outside project", http.StatusForbidden)
 		return
 	}
+	if ok, reason := fsAllowed(req.Path); !ok {
+		http.Error(w, reason, http.StatusForbidden)
+		return
+	}
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1048,6 +1100,10 @@ func (a *API) handleFSDelete(w http.ResponseWriter, r *http.Request) {
 	_, full, ok := a.resolveProjectPath(req.ProjectID, req.Path)
 	if !ok {
 		http.Error(w, "path outside project", http.StatusForbidden)
+		return
+	}
+	if ok, reason := fsAllowed(req.Path); !ok {
+		http.Error(w, reason, http.StatusForbidden)
 		return
 	}
 	if err := os.Remove(full); err != nil {
@@ -1100,6 +1156,10 @@ func (a *API) handleFSPatch(w http.ResponseWriter, r *http.Request) {
 	_, full, ok := a.resolveProjectPath(req.ProjectID, req.Path)
 	if !ok {
 		http.Error(w, "path outside project", http.StatusForbidden)
+		return
+	}
+	if ok, reason := fsAllowed(req.Path); !ok {
+		http.Error(w, reason, http.StatusForbidden)
 		return
 	}
 	b, err := os.ReadFile(full)
@@ -1506,14 +1566,53 @@ func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []
 		cand = append(cand, scored{s: h, adj: adj})
 	}
 	sort.SliceStable(cand, func(i, j int) bool { return cand[i].adj > cand[j].adj })
-	seen := make(map[string]bool)
-	hits := make([]models.SearchResult, 0, k)
+	// group top candidates by path and deduplicate overlapping ranges
+	type rng struct{ s, e int }
+	grouped := make(map[string][]rng)
+	addRange := func(path string, s, e int) bool {
+		if s <= 0 {
+			s = 1
+		}
+		if e > 0 && e < s {
+			e = s
+		}
+		rr := grouped[path]
+		for _, r := range rr {
+			// overlap/adjacent: skip to avoid redundancy
+			if (e == 0 || r.e == 0) || !(e < r.s || r.e < s) {
+				return false
+			}
+		}
+		grouped[path] = append(rr, rng{s: s, e: e})
+		return true
+	}
+	// fill grouped ranges honoring k budget on unique paths first
 	for _, c := range cand {
-		if seen[c.s.Path] {
+		p := c.s.Path
+		if len(grouped) >= k && grouped[p] == nil {
 			continue
 		}
-		seen[c.s.Path] = true
-		hits = append(hits, c.s)
+		_ = addRange(p, c.s.StartLine, c.s.EndLine)
+	}
+	// flatten to ordered hits with one or two ranges per path
+	paths := make([]string, 0, len(grouped))
+	for p := range grouped {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	hits := make([]models.SearchResult, 0, k)
+	for _, p := range paths {
+		rr := grouped[p]
+		// cap ranges per path to 2 for diversity
+		if len(rr) > 2 {
+			rr = rr[:2]
+		}
+		for _, r := range rr {
+			hits = append(hits, models.SearchResult{Path: p, StartLine: r.s, EndLine: r.e})
+			if len(hits) >= k {
+				break
+			}
+		}
 		if len(hits) >= k {
 			break
 		}
@@ -1541,6 +1640,7 @@ func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []
 	var b strings.Builder
 	b.WriteString("You are a coding assistant. Use the following repo context and cite files with line ranges. If not enough evidence, say you are unsure.\n\n")
 	b.WriteString("Context:\n")
+	// approximate token budget in bytes
 	budget := 3000
 	var root string
 	if p, ok := a.store.GetProject(projectID); ok {
@@ -1557,10 +1657,6 @@ func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []
 		}
 		b.WriteString("- ")
 		b.WriteString(loc)
-		if strings.TrimSpace(h.Preview) != "" {
-			b.WriteString(" — ")
-			b.WriteString(h.Preview)
-		}
 		b.WriteString("\n")
 		if root != "" {
 			code := readSnippet(root, h.Path, h.StartLine, h.EndLine, 24)

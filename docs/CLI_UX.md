@@ -1,5 +1,12 @@
 # CLI UX 명세
 
+## 설치/실행
+- 설치: `make install` (기본 경로: `$HOME/.mycoder/bin/mycoder`)
+  - PATH 설정 힌트 자동 출력, 재출력: `make print-path-hint`
+  - PATH 수동 설정: `echo 'export PATH="$HOME/.mycoder/bin:$PATH"' >> ~/.bashrc` 후 `source ~/.bashrc`
+- 동작 확인: `make smoke` (서버 기동 후 `/healthz` 헬스체크)
+  - 임의 포트 사용: `make smoke PORT=8090`
+
 ## 명령어
 - `mycoder chat` : 대화형 모드(SSE 스트리밍, 인용 표시).
 - `mycoder ask "<질문>" [--project <id>] [--k 5]` : 일회성 Q&A(RAG 컨텍스트 포함).
@@ -9,6 +16,7 @@
 - `mycoder explain <path|symbol>` : 파일/심볼 설명.
 - `mycoder edit --goal "<설명>" [--files ...]` : 패치 제안→미리보기→적용.
 - `mycoder test [--target <pkg|path>]` : 테스트 실행.
+  - `mycoder test --project <id> [--timeout 60] [--verbose]` : 서버 훅 API를 통해 테스트만 실행
 - `mycoder index [--full|--incremental]` : 인덱싱 수행.
   - 옵션: `--max-files`, `--max-bytes`, `--include '<glob,glob>'`, `--exclude '<glob,glob>'`
   - `--stream` 사용 시 진행상황 스트리밍(SSE). 이벤트에 따라 `job`, `progress indexed/total`, `completed` 표시
@@ -44,7 +52,7 @@
 - 모든 답변은 인용(파일:시작–끝 라인) 포함.
 - 디프는 컬러 미리보기 후 적용 여부 확인.
 - 실패 시 진단/자동 제안 표시, 재시도 옵션 제공.
-- 설정 파일: `~/.mycoder/config.yaml` (프로파일/API 키/백엔드 설정).
+- 설정 파일: `~/.mycoder/config.yaml` (프로파일/API 키/백엔드 설정). 환경변수가 우선.
  - 서버 주소: `MYCODER_SERVER_URL`(기본 `http://localhost:8089`)
  - LLM 설정(환경변수):
    - LM Studio(기본): `MYCODER_OPENAI_BASE_URL=http://localhost:1234/v1`, `MYCODER_OPENAI_API_KEY=`(빈값 허용)

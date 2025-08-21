@@ -96,14 +96,17 @@
 ### POST /fs/write
 - 요청: `{ projectID, path, content, createIfMissing?:boolean, overwrite?:boolean }`
 - 응답: `{ path, sha }`
+ - 정책: `MYCODER_FS_ALLOW_REGEX`/`MYCODER_FS_DENY_REGEX`로 상대경로 허용·차단 제어
 
 ### POST /fs/patch
 - 요청: `{ projectID, path, hunks:[{start,length,replace}] }`
 - 응답: `{ ok:true }`
+ - 정책: `MYCODER_FS_ALLOW_REGEX`/`MYCODER_FS_DENY_REGEX` 적용
 
 ### POST /fs/delete
 - 요청: `{ projectID, path }`
 - 응답: `{ ok:true }`
+ - 정책: `MYCODER_FS_ALLOW_REGEX`/`MYCODER_FS_DENY_REGEX` 적용
 
 ## 터미널 실행 API
 - 스트리밍: SSE. 시간/메모리/출력 제한, 허용/차단 목록.

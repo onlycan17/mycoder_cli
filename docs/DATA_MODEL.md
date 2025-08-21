@@ -30,6 +30,11 @@
 - 색인: Document(path,projectID), Chunk(docID,ordinal), TermIndex(term), Symbol(name,kind), Run(startedAt).
 - 벡터 인덱스: 외부 VectorStore(Qdrant/pgvector/sqlite-vec) 관리.
 
+## SQLite 테이블(요약)
+- embeddings(id, project_id, doc_id, chunk_id, provider, model, dim, vector JSON, created_at)
+- patches(id, project_id, path, hunks JSON, applied, created_at, applied_at)
+- symbols(id, project_id, path, lang, name, kind, start_line, end_line, signature, created_at)
+
 ## 벡터 스토어 권장 스펙
 - 로컬/개발: SQLite+FTS5(필수), sqlite-vec(선택). 벡터 미사용 시에도 레키시컬 검색으로 동작.
 - 프로덕션 권장: PostgreSQL 15+ + pgvector 0.6+ (HNSW). cosine, m=16, ef_construction=128, ef_search=40, lists는 데이터 크기별 튜닝. 임베딩 차원 1536.

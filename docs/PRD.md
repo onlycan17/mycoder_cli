@@ -3,6 +3,8 @@
 ## 1. 개요
 - 목적: REST로 LLM을 연동하고, 프로젝트 인지형 RAG를 탑재한 Claude Code 스타일 개발 보조 CLI 제공.
 - 핵심가치: 빠른 코드 탐색, 정확한 수정 제안, 자동 게이트(`make fmt && make test && make lint`)를 통한 신뢰성.
+- 프로그램 명령어: `mycoder` (단일 바이너리)
+- 설치 기본 경로: `$HOME/.mycoder/bin/mycoder` (`make install`), PATH 힌트 자동 출력
 - 성공지표:
   - 인덱싱 완료 후 응답 p50 < 5s, 콜드 스타트 < 60s.
   - 패치 적용 후 포맷/린트 95% 1회 통과.

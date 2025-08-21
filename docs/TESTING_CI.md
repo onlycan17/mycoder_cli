@@ -6,6 +6,12 @@
 - `make lint` : `go vet` 기반의 기본 정적 분석.
 - `make test` : 단위/계약/소규모 e2e.
 
+## 스모크 테스트(선택)
+- 로컬 동작 확인: `make smoke`
+  - PATH에 설치된 `mycoder` 확인(`which`/`version`) 후 서버를 백그라운드로 기동하고 `/healthz`까지 확인.
+  - 임의 포트: `make smoke PORT=8090`
+  - 설치 전이라면: `make install` 후 실행(기본 `$HOME/.mycoder/bin`)
+
 ## 프리커밋
 - 커밋 직전에 `make fmt && make fmt-check && make test && make lint`를 실행하고, 하나라도 실패하면 커밋을 차단.
 - 설치 방법:

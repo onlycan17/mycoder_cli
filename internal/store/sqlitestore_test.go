@@ -50,13 +50,13 @@ func TestSQLiteUpsertUpdatesContent(t *testing.T) {
 	}
 
 	p := s.CreateProject("p", dir, nil)
-	s.UpsertDocument(p.ID, "a.txt", "alpha", "sha1", "txt")
+	s.UpsertDocument(p.ID, "a.txt", "alpha", "sha1", "txt", "")
 	got := s.Search(p.ID, "delta", 10)
 	if len(got) != 0 {
 		t.Fatalf("expected 0 results before update, got %d", len(got))
 	}
 
-	s.UpsertDocument(p.ID, "a.txt", "alpha delta", "sha2", "txt")
+	s.UpsertDocument(p.ID, "a.txt", "alpha delta", "sha2", "txt", "")
 	got = s.Search(p.ID, "delta", 10)
 	if len(got) == 0 {
 		t.Fatalf("expected results after update")

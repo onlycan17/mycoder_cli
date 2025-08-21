@@ -66,3 +66,25 @@ type Knowledge struct {
 	Symbols    string  `json:"symbols,omitempty"`
 	Tags       string  `json:"tags,omitempty"`
 }
+
+// Run/ExecutionLog models for recording executions (shell/fs/hooks/mcp)
+type Run struct {
+	ID        string     `json:"id"`
+	ProjectID string     `json:"projectID"`
+	Type      string     `json:"type"`   // chat|edit|index|hooks|shell|fs|mcp
+	Status    string     `json:"status"` // pending|running|completed|failed
+	StartedAt time.Time  `json:"startedAt"`
+	Finished  *time.Time `json:"finishedAt,omitempty"`
+	Metrics   string     `json:"metrics,omitempty"`
+	LogsRef   string     `json:"logsRef,omitempty"`
+}
+
+type ExecutionLog struct {
+	ID         string     `json:"id"`
+	RunID      string     `json:"runID"`
+	Kind       string     `json:"kind"` // shell|fs|hook|mcp
+	PayloadRef string     `json:"payloadRef,omitempty"`
+	StartedAt  time.Time  `json:"startedAt"`
+	FinishedAt *time.Time `json:"finishedAt,omitempty"`
+	ExitCode   int        `json:"exitCode"`
+}

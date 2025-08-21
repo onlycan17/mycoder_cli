@@ -106,6 +106,49 @@ func (m Migrator) Up(ctx context.Context, db *sql.DB) error {
             verified_at TEXT,
             FOREIGN KEY(project_id) REFERENCES projects(id)
         );`,
+		// embeddings: store provider/model/dim and vector(json) per chunk/doc
+		`CREATE TABLE IF NOT EXISTS embeddings (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            doc_id TEXT,
+            chunk_id TEXT,
+            provider TEXT,
+            model TEXT,
+            dim INTEGER,
+            vector TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id),
+            FOREIGN KEY(doc_id) REFERENCES documents(id),
+            FOREIGN KEY(chunk_id) REFERENCES chunks(id)
+        );`,
+		`CREATE INDEX IF NOT EXISTS idx_embeddings_project_doc_chunk ON embeddings(project_id, doc_id, chunk_id);`,
+		// patches: record planned/applied patch hunks as json
+		`CREATE TABLE IF NOT EXISTS patches (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            hunks TEXT NOT NULL,
+            applied INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            applied_at TEXT,
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        );`,
+		`CREATE INDEX IF NOT EXISTS idx_patches_project_path ON patches(project_id, path);`,
+		// symbols: code symbols with ranges for navigation
+		`CREATE TABLE IF NOT EXISTS symbols (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            lang TEXT,
+            name TEXT NOT NULL,
+            kind TEXT,
+            start_line INTEGER,
+            end_line INTEGER,
+            signature TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        );`,
+		`CREATE INDEX IF NOT EXISTS idx_symbols_project_name ON symbols(project_id, name);`,
 	}
 	for i, s := range stmts {
 		if _, err := db.ExecContext(ctx, s); err != nil {

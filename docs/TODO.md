@@ -26,34 +26,34 @@
   - [x] pre-commit 훅 스크립트(게이트 통과 시만 커밋)
   - [x] GitHub Actions: CI 워크플로 추가
 - 중분류: 설정/로그/메트릭
-  - [ ] `~/.mycoder/config.yaml` 로드(Viper), env override
-  - [ ] Zerolog 구조화 로그, 로그 마스킹 유틸
+  - [x] `~/.mycoder/config.yaml` 로드(env override)
+  - [x] 구조화 로그(JSON 라인), 민감정보 마스킹 유틸
   - [x] `/metrics`(Prometheus), 기본 지표 등록
   - [x] HTTP 메트릭 라벨 정규화 및 샘플링(`MYCODER_METRICS_SAMPLE_RATE`)
 
 ## 대분류: 저장소/데이터 모델
 - 중분류: 스키마/마이그레이션(SQLite+FTS5)
   - [x] 테이블: Project, Document, Chunk, TermIndex(FTS5), Run, Conversation*, ExecutionLog
-  - [ ] Embedding, Patch, Symbol 스키마 추가
+  - [x] Embedding, Patch, Symbol 스키마 추가
   - [x] Knowledge 스키마 추가(SQLite)
-  - [ ] 마이그레이션 관리(버전, 롤백), 시드 데이터
+  - [x] 마이그레이션 관리(버전, 롤백 일부), 시드 데이터
   - [x] FTS5 인덱스 생성 및 기본 쿼리
 - 중분류: VectorStore 인터페이스/어댑터
-  - [ ] 인터페이스: `Upsert(chunks)`, `Search(embedding,k)`, `Delete(docID)`
-  - [ ] 로컬: no-op(or sqlite-vec 감지) 구현으로 degrade 가능
-  - [ ] 프로덕션: pgvector 어댑터 스텁/설정 스키마
+  - [x] 인터페이스: `Upsert(chunks)`, `Search(embedding,k)`, `Delete(docID)`
+  - [x] 로컬: no-op(or sqlite-vec 감지) 구현으로 degrade 가능
+  - [x] 프로덕션: pgvector 어댑터 스텁/설정 스키마
 - 중분류: DAO/리포지토리
-  - [ ] 프로젝트/문서/청크 CRUD, 일관된 트랜잭션 래퍼
-  - [ ] 실행 로그 기록/조회 API
+  - [x] 프로젝트/문서/청크 CRUD(기본), 일관된 트랜잭션 래퍼
+  - [x] 실행 로그 기록/조회 API
   - [ ] 테스트: 테이블 기반 쿼리/마이그레이션 검증
 
 ## 대분류: 인덱서
 - 중분류: 파일 워커
   - [x] 기본 워커/바이너리 제외/크기 제한
-  - [ ] Git 인지(`git ls-files`), `.gitignore` 준수
+  - [x] Git 인지(`git ls-files`), `.gitignore` 준수
   - [x] 변경 감지(SHA 계산) 토대
   - [x] 증분 인덱싱(sha 기반 삭제/갱신) 완료
-  - [ ] mtime 활용(파일 변경시간 비교 및 보관)
+  - [x] mtime 활용(파일 변경시간 비교 및 보관)
   - [ ] 인덱싱 옵션 확장: `--max-files`/`--max-bytes`/경로 필터(패턴) CLI 전파
 - 중분류: 언어 감지/청킹
   - [ ] 언어 감지(확장자/마임)
@@ -69,9 +69,9 @@
 
 ## 대분류: RAG
 - 중분류: 리트리버
-  - [ ] BM25(FTS5) 상위 K 검색
-  - [ ] 벡터 검색(KNN) 통합
-  - [ ] 하이브리드 결합 ∪ 후 리랭크(LLM/규칙)
+  - [x] BM25(FTS5) 상위 K 검색
+  - [x] 벡터 검색(KNN) 통합
+  - [x] 하이브리드 결합 ∪ 후 리랭크(LLM/규칙)
 - 중분류: 지식(승격/정리)
   - [x] Knowledge 엔드포인트 스켈레톤(add/list/vet)
   - [x] trustScore 기반 리랭크 결합(1차: 경로 일치 가중) 및 유니크 K
@@ -86,8 +86,8 @@
   - [x] 청크 메타 라인 범위 저장 및 응답 startLine/endLine 제공
   - [x] CLI search 파일:라인 표기
 - 중분류: 프롬프트 컴포저/인용
-  - [ ] 인용 형식 `path:start-end` + 캡션 생성
-  - [ ] 토큰 예산 기반 컨텍스트 선택/중복 제거
+  - [x] 인용 형식 `path:start-end` + 캡션/코드 블록
+  - [x] 토큰 예산 기반 컨텍스트 선택/중복 제거(파일별 중복 라인지역 제거, 범위 2개 제한)
 - 중분류: 쿼리 플래너/의도 분류
   - [ ] intent(nav/explain/edit/research) 분류기
   - [ ] 플랜별 컨텍스트 수집 규칙
@@ -158,7 +158,7 @@
   - [x] `/fs/patch`(바이트 오프셋 기반)
   - [x] `/shell/exec`(기본 POST 실행)
   - [x] `/shell/exec/stream`(SSE)
-  - [ ] 쉘/FS 제한/허용·차단 정책, 출력 제한
+  - [x] 쉘/FS 제한/허용·차단 정책(allow/deny regex), 출력 제한
   - [x] `/tools/hooks` (프로젝트 훅 실행 API)
   - [ ] `/mcp/tools`, `/mcp/call`
  - 중분류: 인덱싱 스트리밍
@@ -172,7 +172,8 @@
   - [x] `mycoder projects`, `mycoder index`, `mycoder search`
   - [x] `mycoder ask`, `mycoder chat`
   - [x] `mycoder hooks run`
-  - [ ] `mycoder explain`, `mycoder edit`, `mycoder test`
+  - [ ] `mycoder explain`, `mycoder edit`
+  - [x] `mycoder test`
 - 중분류: 파일/쉘/MCP 명령
   - [x] `mycoder fs read|write|patch|delete`
   - [x] `mycoder fs` 옵션: `--dry-run`/`--yes`

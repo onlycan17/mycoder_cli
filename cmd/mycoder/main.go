@@ -14,11 +14,15 @@ import (
 	"strings"
 	"syscall"
 
+	"mycoder/internal/config"
+	mylog "mycoder/internal/log"
 	"mycoder/internal/server"
 	"mycoder/internal/version"
 )
 
 func main() {
+	// load config file and apply env (env has precedence)
+	_ = config.LoadAndApply()
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)
@@ -29,6 +33,11 @@ func main() {
 		fs := flag.NewFlagSet("serve", flag.ExitOnError)
 		addr := fs.String("addr", ":8089", "listen address")
 		_ = fs.Parse(os.Args[2:])
+		// structured startup log
+		{
+			lg := mylog.New()
+			lg.Info("server.start", "addr", *addr)
+		}
 		if err := server.Run(*addr); err != nil {
 			fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 			os.Exit(1)
@@ -51,6 +60,8 @@ func main() {
 		metricsCmd(os.Args[2:])
 	case "hooks":
 		hooksCmd(os.Args[2:])
+	case "test":
+		testCmd(os.Args[2:])
 	case "exec":
 		execCmd(os.Args[2:])
 	case "knowledge":
@@ -86,11 +97,12 @@ func usage() {
 	fmt.Println("  mycoder knowledge [add|list|vet|promote|reverify|gc]")
 	fmt.Println("  mycoder fs [read|write|delete|patch] --project <id> --path <p> [--content ...] [--start N --length N --replace ...]")
 	fmt.Println("  mycoder exec -- -- <cmd> [args...]")
-	fmt.Println("  mycoder <command> (coming soon): explain | edit | test | hooks | fs | exec | mcp")
+	fmt.Println("  mycoder test --project <id> [--timeout 60] [--verbose]")
+	fmt.Println("  mycoder <command> (coming soon): explain | edit | hooks | fs | exec | mcp")
 }
 
 func isKnownStub(cmd string) bool {
-	known := []string{"ask", "chat", "explain", "edit", "test", "hooks", "fs", "exec", "mcp"}
+	known := []string{"ask", "chat", "explain", "edit", "hooks", "fs", "exec", "mcp"}
 	for _, k := range known {
 		if strings.EqualFold(k, cmd) {
 			return true
@@ -1051,6 +1063,64 @@ func hooksCmd(args []string) {
 		}
 	}
 	if failed {
+		os.Exit(1)
+	}
+}
+
+// testCmd runs only the test target via hooks API for convenience.
+func testCmd(args []string) {
+	fs := flag.NewFlagSet("test", flag.ExitOnError)
+	project := fs.String("project", "", "project ID")
+	timeout := fs.Int("timeout", 60, "timeout in seconds")
+	verbose := fs.Bool("verbose", false, "print test output")
+	_ = fs.Parse(args)
+	if *project == "" {
+		fmt.Println("--project required")
+		os.Exit(1)
+	}
+	body := fmt.Sprintf(`{"projectID":"%s","targets":["test"],"timeoutSec":%d}`, *project, *timeout)
+	resp, err := http.Post(serverURL()+"/tools/hooks", "application/json", strings.NewReader(body))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	var res map[string]struct {
+		Ok         bool   `json:"ok"`
+		Output     string `json:"output"`
+		Suggestion string `json:"suggestion"`
+		DurationMs int    `json:"durationMs"`
+		Lines      int    `json:"lines"`
+		Bytes      int    `json:"bytes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		// fallback raw
+		_, _ = io.Copy(os.Stdout, resp.Body)
+		return
+	}
+	v, ok := res["test"]
+	if !ok {
+		fmt.Println("no test result returned")
+		os.Exit(1)
+	}
+	mark := "✅"
+	if !v.Ok {
+		mark = "❌"
+	}
+	suffix := fmt.Sprintf(" (%dms, %d ln, %d B)", v.DurationMs, v.Lines, v.Bytes)
+	fmt.Printf("%s test%s\n", mark, suffix)
+	if v.Suggestion != "" {
+		fmt.Printf("  Hint: %s\n", v.Suggestion)
+	}
+	if *verbose || !v.Ok {
+		for _, line := range strings.Split(v.Output, "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			fmt.Printf("  %s\n", line)
+		}
+	}
+	if !v.Ok {
 		os.Exit(1)
 	}
 }

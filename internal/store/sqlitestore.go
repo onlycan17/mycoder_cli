@@ -35,10 +35,12 @@ func NewSQLite(path string) (*SQLiteStore, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	// migrate (method call on composite literal requires parentheses)
-	if err := (sqlm.Migrator{}).Up(context.Background(), db); err != nil {
+	// migration manager with versioning
+	if err := (sqlm.Manager{}).UpToLatest(context.Background(), db); err != nil {
 		return nil, err
 	}
+	// optional seed data
+	_ = (sqlm.Manager{}).Seed(context.Background(), db)
 	return &SQLiteStore{db: db, jobs: make(map[string]*models.IndexJob)}, nil
 }
 
@@ -49,6 +51,20 @@ func dirOf(path string) string {
 		}
 	}
 	return "."
+}
+
+// WithTx provides a simple transaction wrapper that commits on nil error
+// and rolls back on error. The callback must not hold the tx beyond return.
+func (s *SQLiteStore) WithTx(fn func(*sql.Tx) error) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *SQLiteStore) nextID(prefix string) string {
@@ -63,6 +79,72 @@ func (s *SQLiteStore) CreateProject(name, root string, ignore []string) *models.
 	id := s.nextID("proj")
 	_, _ = s.db.Exec(`INSERT INTO projects(id,name,root_path,created_at) VALUES(?,?,?,?)`, id, name, root, time.Now().Format(time.RFC3339))
 	return &models.Project{ID: id, Name: name, RootPath: root, Ignore: ignore, Created: time.Now()}
+}
+
+// Runs / Execution Logs
+func (s *SQLiteStore) CreateRun(projectID, typ, status string) (*models.Run, error) {
+	if status == "" {
+		status = "running"
+	}
+	id := s.nextID("run")
+	now := time.Now().Format(time.RFC3339)
+	_, err := s.db.Exec(`INSERT INTO runs(id,project_id,type,status,started_at) VALUES(?,?,?,?,?)`, id, projectID, typ, status, now)
+	if err != nil {
+		return nil, err
+	}
+	return &models.Run{ID: id, ProjectID: projectID, Type: typ, Status: status, StartedAt: time.Now()}, nil
+}
+
+func (s *SQLiteStore) FinishRun(id, status, metrics, logsRef string) error {
+	now := time.Now().Format(time.RFC3339)
+	if status == "" {
+		status = "completed"
+	}
+	_, err := s.db.Exec(`UPDATE runs SET status=?, finished_at=?, metrics=?, logs_ref=? WHERE id=?`, status, now, metrics, logsRef, id)
+	return err
+}
+
+func (s *SQLiteStore) AddExecutionLog(runID, kind, payloadRef string, exitCode int) (*models.ExecutionLog, error) {
+	id := s.nextID("xlog")
+	now := time.Now().Format(time.RFC3339)
+	_, err := s.db.Exec(`INSERT INTO execution_logs(id,run_id,kind,payload_ref,started_at,finished_at,exit_code) VALUES(?,?,?,?,?,?,?)`, id, runID, kind, payloadRef, now, now, exitCode)
+	if err != nil {
+		return nil, err
+	}
+	t := time.Now()
+	return &models.ExecutionLog{ID: id, RunID: runID, Kind: kind, PayloadRef: payloadRef, StartedAt: t, FinishedAt: &t, ExitCode: exitCode}, nil
+}
+
+func (s *SQLiteStore) ListExecutionLogs(runID string) ([]*models.ExecutionLog, error) {
+	rows, err := s.db.Query(`SELECT id, kind, payload_ref, started_at, finished_at, exit_code FROM execution_logs WHERE run_id=? ORDER BY started_at`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*models.ExecutionLog
+	for rows.Next() {
+		var id, kind, payload, started, finished sql.NullString
+		var exit int
+		if err := rows.Scan(&id, &kind, &payload, &started, &finished, &exit); err == nil {
+			var st, ft time.Time
+			if started.Valid {
+				st, _ = time.Parse(time.RFC3339, started.String)
+			}
+			if finished.Valid {
+				t, _ := time.Parse(time.RFC3339, finished.String)
+				ft = t
+			}
+			var ftPtr *time.Time
+			if !ft.IsZero() {
+				ftPtr = &ft
+			}
+			out = append(out, &models.ExecutionLog{
+				ID: id.String, RunID: runID, Kind: kind.String, PayloadRef: payload.String,
+				StartedAt: st, FinishedAt: ftPtr, ExitCode: exit,
+			})
+		}
+	}
+	return out, nil
 }
 
 func (s *SQLiteStore) ListProjects() []*models.Project {
@@ -96,6 +178,46 @@ func (s *SQLiteStore) GetProject(id string) (*models.Project, bool) {
 		p.Created = t
 	}
 	return &p, true
+}
+
+// UpdateProjectName renames a project.
+func (s *SQLiteStore) UpdateProjectName(id, name string) error {
+	_, err := s.db.Exec(`UPDATE projects SET name=? WHERE id=?`, name, id)
+	return err
+}
+
+// DeleteProject removes a project and its documents/chunks/termindex.
+func (s *SQLiteStore) DeleteProject(id string) error {
+	return s.WithTx(func(tx *sql.Tx) error {
+		// collect doc ids to cascade delete chunks and terms
+		rows, err := tx.Query(`SELECT id FROM documents WHERE project_id=?`, id)
+		if err != nil {
+			return err
+		}
+		var ids []string
+		for rows.Next() {
+			var did string
+			if err := rows.Scan(&did); err == nil {
+				ids = append(ids, did)
+			}
+		}
+		rows.Close()
+		for _, did := range ids {
+			if _, err := tx.Exec(`DELETE FROM termindex WHERE doc_id=?`, did); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`DELETE FROM chunks WHERE doc_id=?`, did); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(`DELETE FROM documents WHERE project_id=?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM projects WHERE id=?`, id); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 // Jobs (in-memory)
@@ -159,7 +281,7 @@ func (s *SQLiteStore) AddDocument(projectID, path, content string) *models.Docum
 }
 
 // IncrementalStore implementation
-func (s *SQLiteStore) UpsertDocument(projectID, path, content, sha, lang string) *models.Document {
+func (s *SQLiteStore) UpsertDocument(projectID, path, content, sha, lang, mtime string) *models.Document {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return &models.Document{ID: "", ProjectID: projectID, Path: path}
@@ -168,12 +290,13 @@ func (s *SQLiteStore) UpsertDocument(projectID, path, content, sha, lang string)
 
 	// lookup existing document
 	var existingID, existingSHA string
-	_ = tx.QueryRow(`SELECT id, sha FROM documents WHERE project_id=? AND path=?`, projectID, path).Scan(&existingID, &existingSHA)
+	var existingMTime string
+	_ = tx.QueryRow(`SELECT id, sha, mtime FROM documents WHERE project_id=? AND path=?`, projectID, path).Scan(&existingID, &existingSHA, &existingMTime)
 	now := time.Now().Format(time.RFC3339)
 	if existingID == "" {
 		// insert new document
 		id := s.nextID("doc")
-		_, _ = tx.Exec(`INSERT INTO documents(id,project_id,path,sha,lang,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`, id, projectID, path, sha, lang, now, now)
+		_, _ = tx.Exec(`INSERT INTO documents(id,project_id,path,sha,lang,mtime,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, id, projectID, path, sha, lang, mtime, now, now)
 		// index chunks
 		chunks := chunkTextWithLines(content, 2000)
 		for i, ch := range chunks {
@@ -185,12 +308,12 @@ func (s *SQLiteStore) UpsertDocument(projectID, path, content, sha, lang string)
 		return &models.Document{ID: id, ProjectID: projectID, Path: path}
 	}
 	// if sha unchanged, skip reindex
-	if sha != "" && existingSHA == sha {
+	if (sha != "" && existingSHA == sha) || (mtime != "" && existingMTime == mtime) {
 		_ = tx.Commit()
 		return &models.Document{ID: existingID, ProjectID: projectID, Path: path}
 	}
 	// update sha/lang/updated_at
-	_, _ = tx.Exec(`UPDATE documents SET sha=?, lang=?, updated_at=? WHERE id=?`, sha, lang, now, existingID)
+	_, _ = tx.Exec(`UPDATE documents SET sha=?, lang=?, mtime=?, updated_at=? WHERE id=?`, sha, lang, mtime, now, existingID)
 	// reindex chunks: delete old entries then insert new
 	_, _ = tx.Exec(`DELETE FROM termindex WHERE doc_id=?`, existingID)
 	_, _ = tx.Exec(`DELETE FROM chunks WHERE doc_id=?`, existingID)
@@ -202,6 +325,37 @@ func (s *SQLiteStore) UpsertDocument(projectID, path, content, sha, lang string)
 	}
 	_ = tx.Commit()
 	return &models.Document{ID: existingID, ProjectID: projectID, Path: path}
+}
+
+// GetDocument returns a document metadata by project and path.
+func (s *SQLiteStore) GetDocument(projectID, path string) (*models.Document, bool) {
+	row := s.db.QueryRow(`SELECT id, project_id, path FROM documents WHERE project_id=? AND path=?`, projectID, path)
+	var d models.Document
+	if err := row.Scan(&d.ID, &d.ProjectID, &d.Path); err != nil {
+		return nil, false
+	}
+	return &d, true
+}
+
+// DeleteDocument deletes a document and its chunks/index entries.
+func (s *SQLiteStore) DeleteDocument(projectID, path string) error {
+	return s.WithTx(func(tx *sql.Tx) error {
+		var id string
+		_ = tx.QueryRow(`SELECT id FROM documents WHERE project_id=? AND path=?`, projectID, path).Scan(&id)
+		if id == "" {
+			return nil
+		}
+		if _, err := tx.Exec(`DELETE FROM termindex WHERE doc_id=?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM chunks WHERE doc_id=?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM documents WHERE id=?`, id); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func (s *SQLiteStore) PruneDocuments(projectID string, present []string) error {
