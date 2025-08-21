@@ -44,3 +44,21 @@ func TestShellExecStreamEmitsStdoutAndExit(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestShellExecStreamSummaryEvent(t *testing.T) {
+	st := store.New()
+	api := NewAPI(st, nil)
+	p := st.CreateProject("shs", t.TempDir(), nil)
+	mux := api.mux()
+	body := map[string]any{"projectID": p.ID, "cmd": "echo", "args": []string{"stream"}, "timeoutSec": 5}
+	b, _ := json.Marshal(body)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/shell/exec/stream", bytes.NewReader(b)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	out := rr.Body.String()
+	if !strings.Contains(out, "event: summary") {
+		t.Fatalf("missing summary event: %q", out)
+	}
+}

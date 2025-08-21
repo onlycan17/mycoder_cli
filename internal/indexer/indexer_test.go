@@ -28,3 +28,25 @@ func TestIndexBasic(t *testing.T) {
 		t.Fatalf("expected 2 docs, got %d", len(docs))
 	}
 }
+
+func TestIndexIncludeExclude(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "b.md"), []byte("# doc\n"), 0o644)
+	// include only *.md
+	docs, err := Index(dir, Options{MaxFiles: 10, MaxFileSize: 1024, Include: []string{"*.md"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != 1 || docs[0].Path != "b.md" {
+		t.Fatalf("include filter failed: %+v", docs)
+	}
+	// exclude *.md
+	docs, err = Index(dir, Options{MaxFiles: 10, MaxFileSize: 1024, Exclude: []string{"*.md"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != 1 || docs[0].Path != "a.go" {
+		t.Fatalf("exclude filter failed: %+v", docs)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -68,6 +69,7 @@ type capBuffer struct {
 	n         int
 	cap       int
 	truncated bool
+	lines     int
 }
 
 func newCapBuffer(limit int) *capBuffer { return &capBuffer{b: make([]byte, 0, limit), cap: limit} }
@@ -75,18 +77,52 @@ func newCapBuffer(limit int) *capBuffer { return &capBuffer{b: make([]byte, 0, l
 func (c *capBuffer) Write(p []byte) (int, error) {
 	remain := c.cap - c.n
 	if remain > 0 {
-		if len(p) <= remain {
-			c.b = append(c.b, p...)
-			c.n += len(p)
-		} else {
-			c.b = append(c.b, p[:remain]...)
-			c.n += remain
+		write := p
+		if len(p) > remain {
+			write = p[:remain]
 			c.truncated = true
 		}
+		// count newlines in the portion we keep
+		for i := 0; i < len(write); i++ {
+			if write[i] == '\n' {
+				c.lines++
+			}
+		}
+		c.b = append(c.b, write...)
+		c.n += len(write)
 	} else {
 		c.truncated = true
 	}
 	return len(p), nil
+}
+
+// Shell policy (allow/deny regex)
+var (
+	shellPolicyOnce sync.Once
+	allowRe         *regexp.Regexp
+	denyRe          *regexp.Regexp
+)
+
+func loadShellPolicy() {
+	shellPolicyOnce.Do(func() {
+		if v := os.Getenv("MYCODER_SHELL_ALLOW_REGEX"); v != "" {
+			allowRe, _ = regexp.Compile(v)
+		}
+		if v := os.Getenv("MYCODER_SHELL_DENY_REGEX"); v != "" {
+			denyRe, _ = regexp.Compile(v)
+		}
+	})
+}
+
+func shellAllowed(cmdline string) (bool, string) {
+	loadShellPolicy()
+	if denyRe != nil && denyRe.MatchString(cmdline) {
+		return false, "command denied by policy"
+	}
+	if allowRe != nil && !allowRe.MatchString(cmdline) {
+		return false, "command not allowed by policy"
+	}
+	return true, ""
 }
 
 // lightweight in-process metrics collector
@@ -149,6 +185,7 @@ func (a *API) mux() *http.ServeMux {
 	})
 	mux.HandleFunc("/projects", a.handleProjects)
 	mux.HandleFunc("/index/run", a.handleIndexRun)
+	mux.HandleFunc("/index/run/stream", a.handleIndexRunStream)
 	mux.HandleFunc("/index/jobs/", a.handleIndexJob)
 	mux.HandleFunc("/search", a.handleSearch)
 	mux.HandleFunc("/metrics", a.handleMetrics)
@@ -325,6 +362,10 @@ func (a *API) handleIndexRun(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ProjectID string           `json:"projectID"`
 		Mode      models.IndexMode `json:"mode"`
+		MaxFiles  int              `json:"maxFiles"`
+		MaxBytes  int64            `json:"maxBytes"`
+		Include   []string         `json:"include"`
+		Exclude   []string         `json:"exclude"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
@@ -347,7 +388,20 @@ func (a *API) handleIndexRun(w http.ResponseWriter, r *http.Request) {
 		_, _ = a.store.SetJobStatus(id, models.JobRunning, nil)
 		// fetch project root
 		if p, ok := a.store.GetProject(req.ProjectID); ok {
-			docs, _ := indexer.Index(p.RootPath, indexer.Options{MaxFiles: 500, MaxFileSize: 256 * 1024})
+			opt := indexer.Options{MaxFiles: 500, MaxFileSize: 256 * 1024}
+			if req.MaxFiles > 0 {
+				opt.MaxFiles = req.MaxFiles
+			}
+			if req.MaxBytes > 0 {
+				opt.MaxFileSize = req.MaxBytes
+			}
+			if len(req.Include) > 0 {
+				opt.Include = req.Include
+			}
+			if len(req.Exclude) > 0 {
+				opt.Exclude = req.Exclude
+			}
+			docs, _ := indexer.Index(p.RootPath, opt)
 			// incremental if supported
 			if inc, ok := a.store.(IncrementalStore); ok {
 				present := make([]string, 0, len(docs))
@@ -369,6 +423,111 @@ func (a *API) handleIndexRun(w http.ResponseWriter, r *http.Request) {
 	}(job.ID)
 
 	writeJSON(w, http.StatusOK, map[string]string{"jobID": job.ID})
+}
+
+// SSE streaming version: emits job, progress, completed events while indexing
+func (a *API) handleIndexRunStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ProjectID string           `json:"projectID"`
+		Mode      models.IndexMode `json:"mode"`
+		MaxFiles  int              `json:"maxFiles"`
+		MaxBytes  int64            `json:"maxBytes"`
+		Include   []string         `json:"include"`
+		Exclude   []string         `json:"exclude"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if req.Mode == "" {
+		req.Mode = models.IndexFull
+	}
+	p, ok := a.store.GetProject(req.ProjectID)
+	if !ok {
+		http.Error(w, "project not found", http.StatusBadRequest)
+		return
+	}
+	job, err := a.store.CreateIndexJob(req.ProjectID, req.Mode)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_, _ = a.store.SetJobStatus(job.ID, models.JobRunning, nil)
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	fl, _ := w.(http.Flusher)
+	send := func(event, data string) {
+		fmt.Fprintf(w, "event: %s\n", event)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		if fl != nil {
+			fl.Flush()
+		}
+	}
+	send("job", job.ID)
+
+	// perform indexing (collection phase)
+	opt := indexer.Options{MaxFiles: 500, MaxFileSize: 256 * 1024}
+	if req.MaxFiles > 0 {
+		opt.MaxFiles = req.MaxFiles
+	}
+	if req.MaxBytes > 0 {
+		opt.MaxFileSize = req.MaxBytes
+	}
+	if len(req.Include) > 0 {
+		opt.Include = req.Include
+	}
+	if len(req.Exclude) > 0 {
+		opt.Exclude = req.Exclude
+	}
+	docs, err := indexer.Index(p.RootPath, opt)
+	if err != nil {
+		send("error", jsonEscape(err.Error()))
+		return
+	}
+	total := len(docs)
+	if total == 0 {
+		_, _ = a.store.SetJobStatus(job.ID, models.JobCompleted, map[string]int{"documents": 0})
+		send("completed", `{"documents":0}`)
+		return
+	}
+	// ingestion phase with progress, respect client cancel
+	reqCtx := r.Context()
+	ingested := 0
+	if inc, ok := a.store.(IncrementalStore); ok {
+		present := make([]string, 0, total)
+		for _, d := range docs {
+			if reqCtx.Err() != nil {
+				return
+			}
+			inc.UpsertDocument(p.ID, d.Path, d.Content, d.SHA, d.Lang)
+			present = append(present, d.Path)
+			ingested++
+			if ingested%10 == 0 || ingested == total {
+				send("progress", fmt.Sprintf(`{"indexed":%d,"total":%d}`, ingested, total))
+			}
+		}
+		_ = inc.PruneDocuments(p.ID, present)
+	} else {
+		for _, d := range docs {
+			if reqCtx.Err() != nil {
+				return
+			}
+			a.store.AddDocument(p.ID, d.Path, d.Content)
+			ingested++
+			if ingested%10 == 0 || ingested == total {
+				send("progress", fmt.Sprintf(`{"indexed":%d,"total":%d}`, ingested, total))
+			}
+		}
+	}
+	stats := map[string]int{"documents": total}
+	_, _ = a.store.SetJobStatus(job.ID, models.JobCompleted, stats)
+	// completed
+	send("completed", fmt.Sprintf(`{"documents":%d}`, total))
 }
 
 func (a *API) handleIndexJob(w http.ResponseWriter, r *http.Request) {
@@ -725,6 +884,9 @@ func (a *API) handleToolsHooks(w http.ResponseWriter, r *http.Request) {
 		Ok         bool   `json:"ok"`
 		Output     string `json:"output"`
 		Suggestion string `json:"suggestion,omitempty"`
+		DurationMs int    `json:"durationMs"`
+		Lines      int    `json:"lines"`
+		Bytes      int    `json:"bytes"`
 	}
 	out := map[string]result{}
 	timeout := 60 * time.Second
@@ -745,11 +907,20 @@ func (a *API) handleToolsHooks(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		cmd.Env = env
+		start := time.Now()
 		b, err := cmd.CombinedOutput()
+		dur := time.Since(start)
 		cancel()
 		ok := err == nil
 		rstr := string(b)
-		out[t] = result{Ok: ok, Output: rstr, Suggestion: hintFromOutput(t, rstr)}
+		out[t] = result{
+			Ok:         ok,
+			Output:     rstr,
+			Suggestion: hintFromOutput(t, rstr),
+			DurationMs: int(dur.Milliseconds()),
+			Lines:      countLines(rstr),
+			Bytes:      len(b),
+		}
 		if !ok {
 			// stop on first failure to follow gate behavior
 			break
@@ -794,6 +965,23 @@ func hintFromOutput(target, output string) string {
 		return "타임아웃이 발생했습니다. --timeout 값을 늘려보세요."
 	}
 	return ""
+}
+
+func countLines(s string) int {
+	if s == "" {
+		return 0
+	}
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			n++
+		}
+	}
+	// if last line has no trailing newline, count it as a line
+	if s[len(s)-1] != '\n' {
+		n++
+	}
+	return n
 }
 
 // FS handlers (project-root confined)
@@ -970,11 +1158,15 @@ func (a *API) handleShellExec(w http.ResponseWriter, r *http.Request) {
 	if req.TimeoutSec > 0 {
 		to = time.Duration(req.TimeoutSec) * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), to)
+	ctx, cancel := context.WithTimeout(r.Context(), to)
 	defer cancel()
 	// Build a zsh -lc commandline so users can use shell semantics.
 	cmdline := buildCmdline(req.Cmd, req.Args)
 	cmd := exec.CommandContext(ctx, "/bin/zsh", "-lc", cmdline)
+	if ok, reason := shellAllowed(cmdline); !ok {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": reason})
+		return
+	}
 	// resolve cwd under project root if provided
 	workdir := p.RootPath
 	if strings.TrimSpace(req.Cwd) != "" {
@@ -1005,7 +1197,7 @@ func (a *API) handleShellExec(w http.ResponseWriter, r *http.Request) {
 			exit = -1
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"exitCode": exit, "output": string(cb.b), "truncated": cb.truncated})
+	writeJSON(w, http.StatusOK, map[string]any{"exitCode": exit, "output": string(cb.b), "truncated": cb.truncated, "outputBytes": cb.n, "outputLines": cb.lines})
 }
 
 func (a *API) handleShellExecStream(w http.ResponseWriter, r *http.Request) {
@@ -1033,10 +1225,23 @@ func (a *API) handleShellExecStream(w http.ResponseWriter, r *http.Request) {
 	if req.TimeoutSec > 0 {
 		to = time.Duration(req.TimeoutSec) * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), to)
+	ctx, cancel := context.WithTimeout(r.Context(), to)
 	defer cancel()
 	cmdline := buildCmdline(req.Cmd, req.Args)
 	cmd := exec.CommandContext(ctx, "/bin/zsh", "-lc", cmdline)
+	if ok, _ := shellAllowed(cmdline); !ok {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		fl, _ := w.(http.Flusher)
+		fmt.Fprintf(w, "event: error\n")
+		fmt.Fprintf(w, "data: %s\n\n", jsonEscape("command blocked by policy"))
+		fmt.Fprintf(w, "event: exit\n")
+		fmt.Fprintf(w, "data: 126\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+		return
+	}
 	workdir := p.RootPath
 	if strings.TrimSpace(req.Cwd) != "" {
 		_, full, ok := a.resolveProjectPath(p.ID, req.Cwd)
@@ -1074,6 +1279,7 @@ func (a *API) handleShellExecStream(w http.ResponseWriter, r *http.Request) {
 	limit := 64 * 1024
 	sent := 0
 	limited := false
+	lines := 0
 	sendWithLimit := func(kind, data string) {
 		mu.Lock()
 		if limited {
@@ -1081,6 +1287,7 @@ func (a *API) handleShellExecStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if kind == "stdout" || kind == "stderr" {
+			lines++
 			remain := limit - sent
 			if remain <= 0 {
 				limited = true
@@ -1114,6 +1321,8 @@ func (a *API) handleShellExecStream(w http.ResponseWriter, r *http.Request) {
 			code = -1
 		}
 	}
+	// summary before exit
+	send("summary", fmt.Sprintf(`{"bytes":%d,"lines":%d,"limited":%v}`, sent, lines, limited))
 	send("exit", fmt.Sprintf("%d", code))
 }
 

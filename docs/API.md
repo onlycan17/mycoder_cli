@@ -26,6 +26,12 @@
 ## POST /index/run
 - 요청: `{ projectID, mode:"full|incremental" }`
 - 응답: `{ jobID }`; `GET /index/jobs/:id` → `{ status, stats }`
+ - 옵션 필드: `maxFiles?`, `maxBytes?`, `include?:string[]`, `exclude?:string[]`
+
+### POST /index/run/stream (SSE)
+- 요청: `{ projectID, mode:"full|incremental" }`
+- 이벤트: `job`(잡ID), `progress`(`{indexed,total}`), `completed`(`{documents}`), `error`(메시지)
+ - 옵션 필드: `maxFiles?`, `maxBytes?`, `include?:string[]`, `exclude?:string[]` 적용 가능
 
 ## POST /knowledge
 - 요청: `{ projectID, sourceType:"code|doc|web", pathOrURL?, title?, text, trustScore?, pinned? }`
@@ -66,7 +72,7 @@
 ## POST /tools/hooks
 - 요청: `{ projectID, targets?:string[], timeoutSec?:number, env?:{[k:string]:string} }`
 - 동작: 프로젝트 루트에서 `make <target>` 순차 실행(기본 `fmt-check`, `test`, `lint`), 실패 시 즉시 중단. `env`는 화이트리스트 키만 반영(예: `GOFLAGS`).
-- 응답: `{ <target>:{ok:boolean, output:string, suggestion?:string}, ... }`
+- 응답: `{ <target>:{ ok:boolean, output:string, suggestion?:string, durationMs:number, lines:number, bytes:number }, ... }`
   - suggestion: 출력 패턴 기반 가이드(예: 포맷 실패→`make fmt`, 테스트 실패→`go test ./... -v`, lint 오류→`go vet ./...`)
 
 ## 헬스/메트릭
@@ -104,12 +110,13 @@
 
 ### POST /shell/exec (비스트리밍)
 - 요청: `{ projectID, cmd:string, args?:string[], cwd?:string, env?:{[k:string]:string}, timeoutSec?:number }`
-- 응답: `{ exitCode:number, output:string, truncated?:boolean }` (output은 안전을 위해 기본 64KiB로 캡)
+- 응답: `{ exitCode:number, output:string, truncated?:boolean, outputBytes?:number, outputLines?:number }` (output은 안전을 위해 기본 64KiB로 캡)
 - 실행 셸: zsh(`/bin/zsh -lc`)로 실행. `cwd`는 프로젝트 루트 하위만 허용, `env`는 화이트리스트 키만 반영(`GOFLAGS`,`GOWORK`,`CGO_ENABLED`).
+- 정책: `MYCODER_SHELL_ALLOW_REGEX`/`MYCODER_SHELL_DENY_REGEX`로 실행 커맨드라인 허용·차단(정규식). 차단 시 403 반환.
 
 ### POST /shell/exec/stream (SSE)
 - 요청: `{ projectID, cmd:string, args?:string[], cwd?:string, env?:{[k:string]:string}, timeoutSec?:number }`
-- 이벤트: `stdout`, `stderr`, 마지막 `exit` 이벤트에 종료코드 문자열 포함
+- 이벤트: `stdout`, `stderr`, `summary`(`{bytes,lines,limited}`), 마지막 `exit` 이벤트에 종료코드 문자열 포함
 - 실행 셸/보안 규칙은 `/shell/exec`와 동일
 
 ### POST /shell/exec/stream

@@ -29,6 +29,7 @@
   - [ ] `~/.mycoder/config.yaml` 로드(Viper), env override
   - [ ] Zerolog 구조화 로그, 로그 마스킹 유틸
   - [x] `/metrics`(Prometheus), 기본 지표 등록
+  - [x] HTTP 메트릭 라벨 정규화 및 샘플링(`MYCODER_METRICS_SAMPLE_RATE`)
 
 ## 대분류: 저장소/데이터 모델
 - 중분류: 스키마/마이그레이션(SQLite+FTS5)
@@ -51,7 +52,9 @@
   - [x] 기본 워커/바이너리 제외/크기 제한
   - [ ] Git 인지(`git ls-files`), `.gitignore` 준수
   - [x] 변경 감지(SHA 계산) 토대
-  - [ ] 증분 인덱싱(삭제/갱신 완성) 및 mtime 활용
+  - [x] 증분 인덱싱(sha 기반 삭제/갱신) 완료
+  - [ ] mtime 활용(파일 변경시간 비교 및 보관)
+  - [ ] 인덱싱 옵션 확장: `--max-files`/`--max-bytes`/경로 필터(패턴) CLI 전파
 - 중분류: 언어 감지/청킹
   - [ ] 언어 감지(확장자/마임)
   - [ ] 코드 청커(Go/TS/Py 함수/클래스 단위 + 슬라이딩 보완)
@@ -100,9 +103,10 @@
   - [ ] OpenAI(옵션) 베이스URL/키 전환 가이드 문서화
  - 중분류: 안정성
   - [x] 최소 간격(MYCODER_LLM_MIN_INTERVAL_MS) 및 429/5xx 재시도 백오프
-- 중분류: 스트리밍/SSE
-  - [ ] 서버: 챗 스트림 이벤트(`token|citation|tool_call|done`)
-  - [ ] 클라이언트: TTY 스트리밍/중단 처리
+ - 중분류: 스트리밍/SSE
+  - [x] 서버: 챗 스트림 이벤트 표준화(`token|error|done`)
+  - [x] 클라이언트: 스트리밍 취소(Ctrl‑C) 처리(chat/index/exec)
+  - [ ] 클라이언트: TTY 스트리밍 UI/중단·재시도 UX 고도화
   - [x] 서버/클라이언트: SSE token/done 스트리밍 기본 구현
 
 ## 대분류: 대화 메모리
@@ -120,16 +124,21 @@
   - [ ] 구조화 로그(필드화)/로그 아카이빙
   - [x] 실패 유형 힌트(suggestion) 기본 제공
   - [ ] 실패 유형 진단/가이드 고도화
+  - [x] 결과 요약(타겟별 소요시간/라인·바이트 집계) 출력
+  - [ ] 결과 요약(타겟별 소요시간/라인·바이트 집계) 출력
 - 중분류: 패치 적용기
   - [ ] 유니파이드 디프 파서/생성, 컬러 미리보기, 충돌 처리, 롤백
 - 중분류: 파일시스템 도구
   - [x] read/write/delete 엔드포인트 스텁(루트 경계/정규화)
   - [x] patch 엔드포인트(바이트 오프셋 기반 hunks)
-  - [ ] `--dry-run`/`--yes`, 대량 변경 감지/확인 단계
+  - [x] `--dry-run`/`--yes`
+  - [x] 대량 변경 감지/확인 단계(`--large-threshold-bytes`, `--allow-large`)
 - 중분류: 터미널 실행기
   - [x] `exec` 기본 POST 실행(프로젝트 루트 cwd, 타임아웃)
   - [x] SSE 스트리밍(`/shell/exec/stream`) 클라이언트/서버 기본 구현
-  - [ ] 출력 제한/env 화이트리스트/허용·차단/로그 요약
+  - [x] 출력 제한(비스트리밍 64KiB 캡, 스트리밍 `limit` 이벤트)
+  - [x] env 화이트리스트(`GOFLAGS`,`GOWORK`,`CGO_ENABLED`)
+  - [x] 허용·차단 정책(allow/deny regex), 로그 요약(summary 이벤트/바이트·라인)
 - 중분류: MCP 클라이언트
   - [ ] 도구 목록 조회/스키마 검증/호출
   - [ ] 보안 정책(도메인 허용/토큰 스코프)
@@ -142,7 +151,7 @@
   - [x] `/index/run`, `/index/jobs/:id`
 - 중분류: 검색/챗/에딧
   - [x] `/search`(lexical-FTS5/메모리)
-  - [ ] `/chat`(SSE), `/edits/plan`, `/edits/apply`
+  - [x] `/chat`(SSE 표준 이벤트), `/edits/plan`, `/edits/apply`
   - [x] `/knowledge`(POST/GET), `/knowledge/vet`(POST)
 - 중분류: FS/쉘/MCP
   - [x] `/fs/read|write|delete`(루트 경계)
@@ -152,6 +161,8 @@
   - [ ] 쉘/FS 제한/허용·차단 정책, 출력 제한
   - [x] `/tools/hooks` (프로젝트 훅 실행 API)
   - [ ] `/mcp/tools`, `/mcp/call`
+ - 중분류: 인덱싱 스트리밍
+  - [x] `/index/run/stream`(SSE 진행 이벤트: job/progress/completed)
 - 중분류: 에러/검증/보안
   - [ ] 요청 스키마 검증, 에러코드 표준화
   - [ ] 토큰/프로파일/아웃바운드 정책 적용
@@ -167,11 +178,17 @@
   - [x] `mycoder fs` 옵션: `--dry-run`/`--yes`
   - [x] `mycoder exec -- cmd [args...]`(+ `--timeout`)
   - [x] `mycoder exec --stream`(SSE 소비)
-  - [ ] `mycoder exec` 옵션: `--cwd`/`--env`
+  - [x] `mycoder exec` 옵션: `--cwd`/`--env`
   - [ ] `mycoder mcp tools|call`
-- 중분류: 출력/스트리밍
+ - 중분류: 인덱싱 진행 표시
+  - [x] `mycoder index --stream` 진행상황 표시(job/progress/completed)
+ - 중분류: 기본 명령 출력 개선
+  - [x] `mycoder models` 출력 옵션(`--format|--filter|--color`)
+  - [x] `mycoder metrics` 출력 옵션(`--json|--color`)
+ - 중분류: 출력/스트리밍
   - [ ] 인용/파일:라인 표시, 컬러 디프, 실패 진단/제안
-  - [ ] 스트림 중단/재시도/로그 저장 옵션
+  - [x] 스트림 중단(Ctrl‑C 취소)
+  - [ ] 스트림 재시도/로그 저장 옵션
 
 ## 대분류: 웹 보강(옵션)
 - 중분류: 검색/수집/요약
@@ -200,3 +217,11 @@
 - 언어: Go
 - 벡터 스토어 권장: 프로덕션=PostgreSQL+pgvector(HNSW), 로컬=SQLite+FTS5(+sqlite-vec 선택)
 - [x] FTS5 검색 고도화(프로젝트 필터/청크 색인/프리뷰)
+
+## 제안/아이디어(모든 TODO 완료 후 검토)
+- 스트리밍 진행바: CLI에서 한 줄 갱신(progress bar)로 출력 단순화(chat/index/exec)
+- 스트리밍 재시도/복구: SSE 끊김 시 자동 재연결/재시작 전략
+- 스트림 로그 보존: `--save-log`(경로)로 원시 로그 아카이빙
+- `/metrics` 확장: 지연 히스토그램/요청 크기 메트릭, 라벨 정규화 추가 패턴
+- exec 정책 프리셋: 위험 커맨드 기본 차단 프리셋 제공 + 샘플 정책 번들
+- MCP 통합 백로그: 도구 카탈로그/스키마 검증/보안정책 정리

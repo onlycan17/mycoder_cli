@@ -18,7 +18,9 @@ type FileDoc struct {
 
 type Options struct {
 	MaxFiles    int
-	MaxFileSize int64 // bytes
+	MaxFileSize int64    // bytes
+	Include     []string // glob patterns relative to root
+	Exclude     []string // glob patterns relative to root
 }
 
 var defaultSkips = map[string]struct{}{
@@ -72,8 +74,16 @@ func Index(root string, opt Options) ([]FileDoc, error) {
 			return nil
 		}
 		rel, _ := filepath.Rel(root, path)
+		rel = filepath.ToSlash(rel)
+		// include/exclude filtering (glob). If Include present, must match at least one.
+		if len(opt.Include) > 0 && !matchAny(rel, opt.Include) {
+			return nil
+		}
+		if len(opt.Exclude) > 0 && matchAny(rel, opt.Exclude) {
+			return nil
+		}
 		docs = append(docs, FileDoc{
-			Path:    filepath.ToSlash(rel),
+			Path:    rel,
 			Content: string(b),
 			SHA:     sha256Hex(b),
 			Lang:    detectLang(path),
@@ -106,6 +116,15 @@ func looksBinary(b []byte) bool {
 func sha256Hex(b []byte) string {
 	h := sha256.Sum256(b)
 	return fmt.Sprintf("%x", h[:])
+}
+
+func matchAny(rel string, patterns []string) bool {
+	for _, p := range patterns {
+		if ok, _ := filepath.Match(p, rel); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func detectLang(path string) string {

@@ -158,6 +158,91 @@ func (s *SQLiteStore) AddDocument(projectID, path, content string) *models.Docum
 	return &models.Document{ID: id, ProjectID: projectID, Path: path}
 }
 
+// IncrementalStore implementation
+func (s *SQLiteStore) UpsertDocument(projectID, path, content, sha, lang string) *models.Document {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return &models.Document{ID: "", ProjectID: projectID, Path: path}
+	}
+	defer tx.Rollback()
+
+	// lookup existing document
+	var existingID, existingSHA string
+	_ = tx.QueryRow(`SELECT id, sha FROM documents WHERE project_id=? AND path=?`, projectID, path).Scan(&existingID, &existingSHA)
+	now := time.Now().Format(time.RFC3339)
+	if existingID == "" {
+		// insert new document
+		id := s.nextID("doc")
+		_, _ = tx.Exec(`INSERT INTO documents(id,project_id,path,sha,lang,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`, id, projectID, path, sha, lang, now, now)
+		// index chunks
+		chunks := chunkTextWithLines(content, 2000)
+		for i, ch := range chunks {
+			chkID := s.nextID("chk")
+			_, _ = tx.Exec(`INSERT INTO chunks(id,doc_id,ord,text,token_count,start_line,end_line,created_at) VALUES(?,?,?,?,?,?,?,?)`, chkID, id, i, ch.Text, nil, ch.StartLine, ch.EndLine, now)
+			_, _ = tx.Exec(`INSERT INTO termindex(doc_id,ord,text) VALUES(?,?,?)`, id, i, ch.Text)
+		}
+		_ = tx.Commit()
+		return &models.Document{ID: id, ProjectID: projectID, Path: path}
+	}
+	// if sha unchanged, skip reindex
+	if sha != "" && existingSHA == sha {
+		_ = tx.Commit()
+		return &models.Document{ID: existingID, ProjectID: projectID, Path: path}
+	}
+	// update sha/lang/updated_at
+	_, _ = tx.Exec(`UPDATE documents SET sha=?, lang=?, updated_at=? WHERE id=?`, sha, lang, now, existingID)
+	// reindex chunks: delete old entries then insert new
+	_, _ = tx.Exec(`DELETE FROM termindex WHERE doc_id=?`, existingID)
+	_, _ = tx.Exec(`DELETE FROM chunks WHERE doc_id=?`, existingID)
+	chunks := chunkTextWithLines(content, 2000)
+	for i, ch := range chunks {
+		chkID := s.nextID("chk")
+		_, _ = tx.Exec(`INSERT INTO chunks(id,doc_id,ord,text,token_count,start_line,end_line,created_at) VALUES(?,?,?,?,?,?,?,?)`, chkID, existingID, i, ch.Text, nil, ch.StartLine, ch.EndLine, now)
+		_, _ = tx.Exec(`INSERT INTO termindex(doc_id,ord,text) VALUES(?,?,?)`, existingID, i, ch.Text)
+	}
+	_ = tx.Commit()
+	return &models.Document{ID: existingID, ProjectID: projectID, Path: path}
+}
+
+func (s *SQLiteStore) PruneDocuments(projectID string, present []string) error {
+	// build set for quick lookup
+	keep := make(map[string]struct{}, len(present))
+	for _, p := range present {
+		keep[p] = struct{}{}
+	}
+	// list existing documents for project
+	rows, err := s.db.Query(`SELECT id,path FROM documents WHERE project_id=?`, projectID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var toDelete []string
+	var ids []string
+	for rows.Next() {
+		var id, path string
+		if err := rows.Scan(&id, &path); err == nil {
+			if _, ok := keep[path]; !ok {
+				toDelete = append(toDelete, path)
+				ids = append(ids, id)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		_, _ = tx.Exec(`DELETE FROM termindex WHERE doc_id=?`, id)
+		_, _ = tx.Exec(`DELETE FROM chunks WHERE doc_id=?`, id)
+		_, _ = tx.Exec(`DELETE FROM documents WHERE id=?`, id)
+	}
+	return tx.Commit()
+}
+
 func (s *SQLiteStore) Search(projectID, query string, k int) []models.SearchResult {
 	if k <= 0 {
 		k = 10
@@ -285,76 +370,6 @@ func chunkTextWithLines(s string, maxLen int) []chunk {
 		start = cut
 	}
 	return out
-}
-
-// Incremental operations
-func (s *SQLiteStore) UpsertDocument(projectID, path, content, sha, lang string) *models.Document {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return &models.Document{ID: "", ProjectID: projectID, Path: path}
-	}
-	defer tx.Rollback()
-
-	// find existing
-	var existingID, existingSHA string
-	_ = tx.QueryRow(`SELECT id, COALESCE(sha,'') FROM documents WHERE project_id=? AND path=?`, projectID, path).Scan(&existingID, &existingSHA)
-	now := time.Now().Format(time.RFC3339)
-	var id string
-	if existingID == "" {
-		id = s.nextID("doc")
-		_, _ = tx.Exec(`INSERT INTO documents(id,project_id,path,sha,lang,mtime,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, id, projectID, path, sha, lang, now, now, now)
-	} else {
-		id = existingID
-		if existingSHA == sha {
-			// no changes
-			_ = tx.Commit()
-			return &models.Document{ID: id, ProjectID: projectID, Path: path}
-		}
-		_, _ = tx.Exec(`UPDATE documents SET sha=?, lang=?, mtime=?, updated_at=? WHERE id=?`, sha, lang, now, now, id)
-		// delete old chunks and fts rows
-		_, _ = tx.Exec(`DELETE FROM chunks WHERE doc_id=?`, id)
-		_, _ = tx.Exec(`DELETE FROM termindex WHERE doc_id=?`, id)
-	}
-	chunks := chunkText(content, 2000)
-	for i, ch := range chunks {
-		chkID := s.nextID("chk")
-		_, _ = tx.Exec(`INSERT INTO chunks(id,doc_id,ord,text,token_count,created_at) VALUES(?,?,?,?,?,?)`, chkID, id, i, ch, nil, now)
-		_, _ = tx.Exec(`INSERT INTO termindex(doc_id,ord,text) VALUES(?,?,?)`, id, i, ch)
-	}
-	_ = tx.Commit()
-	return &models.Document{ID: id, ProjectID: projectID, Path: path}
-}
-
-func (s *SQLiteStore) PruneDocuments(projectID string, present []string) error {
-	// build temp table in memory to speed NOT IN
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	_, _ = tx.Exec(`CREATE TEMP TABLE IF NOT EXISTS _present(path TEXT PRIMARY KEY)`)
-	_, _ = tx.Exec(`DELETE FROM _present`)
-	for _, p := range present {
-		_, _ = tx.Exec(`INSERT OR IGNORE INTO _present(path) VALUES(?)`, p)
-	}
-	// select docs to delete
-	rows, err := tx.Query(`SELECT id FROM documents WHERE project_id=? AND path NOT IN (SELECT path FROM _present)`, projectID)
-	if err != nil {
-		return err
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		_ = rows.Scan(&id)
-		ids = append(ids, id)
-	}
-	rows.Close()
-	for _, id := range ids {
-		_, _ = tx.Exec(`DELETE FROM chunks WHERE doc_id=?`, id)
-		_, _ = tx.Exec(`DELETE FROM termindex WHERE doc_id=?`, id)
-		_, _ = tx.Exec(`DELETE FROM documents WHERE id=?`, id)
-	}
-	return tx.Commit()
 }
 
 func (s *SQLiteStore) Stats() map[string]int {

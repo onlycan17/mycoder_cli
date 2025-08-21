@@ -83,12 +83,15 @@ make hook-install
 - 검색: `mycoder search "<query>" [--project <id>]`
 - Q&A: `mycoder ask [--project <id>] [--k 5] "<질문>"`
 - 대화(SSE): `mycoder chat [--project <id>] [--k 5] "<프롬프트>"`
-- 모델 목록: `mycoder models` (OpenAI 호환 `/v1/models` 결과)
-- 메트릭: `mycoder metrics` (Prometheus 텍스트 기본, `?format=json` 지원)
+ - 모델 목록: `mycoder models` (OpenAI 호환 `/v1/models` 결과)
+   - 옵션: `--format table|json|raw`, `--filter <substr>`, `--color`
+ - 메트릭: `mycoder metrics` (Prometheus 텍스트 기본, `?format=json` 지원)
+   - 옵션: `--json`(JSON pretty), `--color`(텍스트 키 컬러)
 - 훅 실행: `mycoder hooks run --project <id> [--targets ...] [--timeout 60] [--verbose]`
   - 서버 API: `POST /tools/hooks` (`env` 화이트리스트 지원: `GOFLAGS` 등)
  - 파일/FS: `mycoder fs read|write|patch|delete --project <id> --path <p> [--content ...] [--start N --length N --replace ...]`
    - 안전장치: `--dry-run`으로 미리보기, `--yes` 없으면 적용 거부(write/delete/patch)
+   - 대량 변경 감지: `--large-threshold-bytes` 초과 시 차단, `--allow-large`로 우회
  - 터미널 실행: `mycoder exec --project <id> -- -- <cmd> [args...]` (비스트리밍, 타임아웃/작업디렉토리/환경 전달 지원)
    - 스트리밍: `mycoder exec --project <id> --stream -- -- <cmd> [args...]` (SSE: stdout/stderr/exit)
    - 출력 제한: 비스트리밍 `--tail N`, `--max-bytes N`; 스트리밍 `--stream-tail N`

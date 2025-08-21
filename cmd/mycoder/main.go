@@ -2,13 +2,17 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
+	"sort"
 	"strings"
+	"syscall"
 
 	"mycoder/internal/server"
 	"mycoder/internal/version"
@@ -143,12 +147,67 @@ func indexCmd(args []string) {
 	fs := flag.NewFlagSet("index", flag.ExitOnError)
 	project := fs.String("project", "", "project ID")
 	mode := fs.String("mode", "full", "full|incremental")
+	stream := fs.Bool("stream", false, "stream progress (SSE)")
+	maxFiles := fs.Int("max-files", 0, "max files to index")
+	maxBytes := fs.Int("max-bytes", 0, "max file size bytes")
+	include := fs.String("include", "", "comma-separated glob patterns to include")
+	exclude := fs.String("exclude", "", "comma-separated glob patterns to exclude")
 	_ = fs.Parse(args)
 	if *project == "" {
 		fmt.Println("--project required")
 		os.Exit(1)
 	}
-	body := fmt.Sprintf(`{"projectID":"%s","mode":"%s"}`, *project, *mode)
+	body := fmt.Sprintf(`{"projectID":"%s","mode":"%s","maxFiles":%d,"maxBytes":%d,"include":[%s],"exclude":[%s]}`,
+		*project, *mode, *maxFiles, *maxBytes, toJSONStringArray(*include), toJSONStringArray(*exclude))
+	if *stream {
+		ctx, cancel := signalContext()
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, serverURL()+"/index/run/stream", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		rd := bufio.NewScanner(resp.Body)
+		lastEvent := ""
+		total, indexed := 0, 0
+		var jobID string
+		for rd.Scan() {
+			line := rd.Text()
+			if strings.HasPrefix(line, "event:") {
+				lastEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+				continue
+			}
+			if strings.HasPrefix(line, "data:") {
+				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				switch lastEvent {
+				case "job":
+					jobID = data
+					fmt.Printf("job: %s\n", jobID)
+				case "progress":
+					// parse {indexed,total}
+					var p struct {
+						Indexed int `json:"indexed"`
+						Total   int `json:"total"`
+					}
+					_ = json.Unmarshal([]byte(data), &p)
+					total = p.Total
+					indexed = p.Indexed
+					// simple progress line
+					fmt.Printf("progress: %d/%d\n", indexed, total)
+				case "completed":
+					fmt.Println("completed")
+				case "error":
+					fmt.Fprintln(os.Stderr, data)
+				default:
+					// ignore
+				}
+			}
+		}
+		return
+	}
 	resp, err := http.Post(serverURL()+"/index/run", "application/json", strings.NewReader(body))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -249,7 +308,9 @@ func chatCmd(args []string) {
 	}
 	q := strings.Join(rest, " ")
 	body := fmt.Sprintf(`{"messages":[{"role":"user","content":%q}],"stream":true,"projectID":"%s","retrieval":{"k":%d}}`, q, *project, *k)
-	req, _ := http.NewRequest(http.MethodPost, serverURL()+"/chat", strings.NewReader(body))
+	ctx, cancel := signalContext()
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, serverURL()+"/chat", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -290,6 +351,11 @@ func chatCmd(args []string) {
 }
 
 func modelsCmd(args []string) {
+	fs := flag.NewFlagSet("models", flag.ExitOnError)
+	format := fs.String("format", "table", "output format: table|json|raw")
+	filter := fs.String("filter", "", "substring filter for model id")
+	color := fs.Bool("color", false, "enable ANSI colors for table")
+	_ = fs.Parse(args)
 	base := os.Getenv("MYCODER_OPENAI_BASE_URL")
 	if base == "" {
 		base = "http://192.168.0.227:3620/v1"
@@ -305,17 +371,127 @@ func modelsCmd(args []string) {
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
-	io.Copy(os.Stdout, resp.Body)
+	if *format == "raw" {
+		io.Copy(os.Stdout, resp.Body)
+		return
+	}
+	var obj map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&obj); err != nil {
+		// fallback raw
+		fmt.Fprintln(os.Stderr, "warning: non-JSON response; printing raw")
+		req2, _ := http.NewRequest(http.MethodGet, url, nil)
+		if key := os.Getenv("MYCODER_OPENAI_API_KEY"); key != "" {
+			req2.Header.Set("Authorization", "Bearer "+key)
+		}
+		resp2, err2 := http.DefaultClient.Do(req2)
+		if err2 == nil {
+			defer resp2.Body.Close()
+			io.Copy(os.Stdout, resp2.Body)
+		} else {
+			fmt.Fprintln(os.Stderr, err2)
+		}
+		return
+	}
+	// collect model ids from OpenAI-like schema {data:[{id:..}]}
+	ids := make([]string, 0)
+	if v, ok := obj["data"]; ok {
+		if arr, ok := v.([]any); ok {
+			for _, it := range arr {
+				if m, ok := it.(map[string]any); ok {
+					if id, ok := m["id"].(string); ok {
+						ids = append(ids, id)
+					}
+				}
+			}
+		}
+	}
+	sort.Strings(ids)
+	if *filter != "" {
+		f := strings.ToLower(*filter)
+		keep := ids[:0]
+		for _, id := range ids {
+			if strings.Contains(strings.ToLower(id), f) {
+				keep = append(keep, id)
+			}
+		}
+		ids = keep
+	}
+	switch *format {
+	case "json":
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"models": ids})
+	default: // table
+		for _, id := range ids {
+			if *color {
+				fmt.Println(colorCyan(id))
+			} else {
+				fmt.Println(id)
+			}
+		}
+	}
 }
 
 func metricsCmd(args []string) {
-	resp, err := http.Get(serverURL() + "/metrics")
+	fs := flag.NewFlagSet("metrics", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "fetch and pretty-print JSON")
+	color := fs.Bool("color", false, "colorize keys (text mode)")
+	_ = fs.Parse(args)
+	url := serverURL() + "/metrics"
+	if *asJSON {
+		url += "?format=json"
+	}
+	resp, err := http.Get(url)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
-	io.Copy(os.Stdout, resp.Body)
+	if !*asJSON {
+		// text mode: passthrough
+		if *color {
+			// naive colorization: highlight metric names at line start
+			rd := bufio.NewScanner(resp.Body)
+			for rd.Scan() {
+				line := rd.Text()
+				if len(line) > 0 && line[0] != '#' && strings.Contains(line, " ") {
+					parts := strings.SplitN(line, " ", 2)
+					fmt.Println(colorCyan(parts[0]) + " " + parts[1])
+				} else {
+					fmt.Println(line)
+				}
+			}
+			return
+		}
+		io.Copy(os.Stdout, resp.Body)
+		return
+	}
+	var m map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		_, _ = io.Copy(os.Stdout, resp.Body)
+		return
+	}
+	// stable key order
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		switch v := m[k].(type) {
+		case float64:
+			if *color {
+				fmt.Printf("%s: %.0f\n", colorCyan(k), v)
+			} else {
+				fmt.Printf("%s: %.0f\n", k, v)
+			}
+		default:
+			b, _ := json.Marshal(v)
+			if *color {
+				fmt.Printf("%s: %s\n", colorCyan(k), string(b))
+			} else {
+				fmt.Printf("%s: %s\n", k, string(b))
+			}
+		}
+	}
 }
 
 func knowledgeCmd(args []string) {
@@ -508,6 +684,16 @@ func tailBytes(s string, max int) string {
 	return s[len(s)-max:]
 }
 
+func colorCyan(s string) string { return "\x1b[36m" + s + "\x1b[0m" }
+
+func signalContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
+	go func() { <-sigc; cancel() }()
+	return ctx, cancel
+}
+
 func fsCmd(args []string) {
 	if len(args) == 0 {
 		fmt.Println("usage: mycoder fs [read|write|delete|patch] --project <id> --path <p> [--content ...] [--start N --length N --replace ...]")
@@ -539,6 +725,8 @@ func fsCmd(args []string) {
 		content := fs.String("content", "", "content")
 		dryRun := fs.Bool("dry-run", false, "print what would change and exit")
 		yes := fs.Bool("yes", false, "apply without prompt (required unless --dry-run)")
+		allowLarge := fs.Bool("allow-large", false, "allow large writes overriding threshold")
+		largeThresh := fs.Int("large-threshold-bytes", 65536, "threshold in bytes to treat as large change")
 		_ = fs.Parse(args[1:])
 		if *project == "" || *path == "" {
 			fmt.Println("--project and --path required")
@@ -547,6 +735,10 @@ func fsCmd(args []string) {
 		if *dryRun {
 			fmt.Printf("[dry-run] write %s (len=%d)\n", *path, len(*content))
 			return
+		}
+		if !*allowLarge && len(*content) > *largeThresh {
+			fmt.Printf("refusing large write (%d bytes > %d). Use --allow-large to proceed or --dry-run to preview.\n", len(*content), *largeThresh)
+			os.Exit(1)
 		}
 		if !*yes {
 			fmt.Println("confirmation required: pass --yes to apply or use --dry-run")
@@ -596,6 +788,8 @@ func fsCmd(args []string) {
 		replace := fs.String("replace", "", "replacement text")
 		dryRun := fs.Bool("dry-run", false, "print what would change and exit")
 		yes := fs.Bool("yes", false, "apply without prompt (required unless --dry-run)")
+		allowLarge := fs.Bool("allow-large", false, "allow large patches overriding threshold")
+		largeThresh := fs.Int("large-threshold-bytes", 65536, "threshold in bytes to treat as large change")
 		_ = fs.Parse(args[1:])
 		if *project == "" || *path == "" {
 			fmt.Println("--project and --path required")
@@ -604,6 +798,14 @@ func fsCmd(args []string) {
 		if *dryRun {
 			fmt.Printf("[dry-run] patch %s start=%d length=%d replace_len=%d\n", *path, *start, *length, len(*replace))
 			return
+		}
+		change := *length
+		if len(*replace) > change {
+			change = len(*replace)
+		}
+		if !*allowLarge && change > *largeThresh {
+			fmt.Printf("refusing large patch (max(change_len,replace_len)=%d > %d). Use --allow-large to proceed or --dry-run to preview.\n", change, *largeThresh)
+			os.Exit(1)
 		}
 		if !*yes {
 			fmt.Println("confirmation required: pass --yes to apply or use --dry-run")
@@ -655,7 +857,9 @@ func execCmd(args []string) {
 	}{ProjectID: *project, Cmd: cmd, Args: argv, Timeout: *timeout, Cwd: *cwd, Env: parseEnvCSV(*envCSV)}
 	b, _ := json.Marshal(body)
 	if *stream {
-		req, _ := http.NewRequest(http.MethodPost, serverURL()+"/shell/exec/stream", strings.NewReader(string(b)))
+		ctx2, cancel2 := signalContext()
+		defer cancel2()
+		req, _ := http.NewRequestWithContext(ctx2, http.MethodPost, serverURL()+"/shell/exec/stream", strings.NewReader(string(b)))
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -785,6 +989,9 @@ func hooksCmd(args []string) {
 		Ok         bool   `json:"ok"`
 		Output     string `json:"output"`
 		Suggestion string `json:"suggestion"`
+		DurationMs int    `json:"durationMs"`
+		Lines      int    `json:"lines"`
+		Bytes      int    `json:"bytes"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		// fallback raw
@@ -802,7 +1009,9 @@ func hooksCmd(args []string) {
 				mark = "❌"
 				failed = true
 			}
-			fmt.Printf("  %s %s\n", mark, k)
+			// summary suffix (e.g., 12ms, 10 ln, 120 B)
+			suffix := fmt.Sprintf(" (%dms, %d ln, %d B)", v.DurationMs, v.Lines, v.Bytes)
+			fmt.Printf("  %s %s%s\n", mark, k, suffix)
 			if v.Suggestion != "" {
 				fmt.Printf("    Hint: %s\n", v.Suggestion)
 			}
@@ -827,7 +1036,8 @@ func hooksCmd(args []string) {
 			mark = "❌"
 			failed = true
 		}
-		fmt.Printf("  %s %s\n", mark, k)
+		suffix := fmt.Sprintf(" (%dms, %d ln, %d B)", v.DurationMs, v.Lines, v.Bytes)
+		fmt.Printf("  %s %s%s\n", mark, k, suffix)
 		if v.Suggestion != "" {
 			fmt.Printf("    Hint: %s\n", v.Suggestion)
 		}

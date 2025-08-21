@@ -5,17 +5,23 @@
 - `mycoder ask "<질문>" [--project <id>] [--k 5]` : 일회성 Q&A(RAG 컨텍스트 포함).
 - `mycoder chat "<프롬프트>" [--project <id>] [--k 5]` : 스트리밍 대화(RAG 컨텍스트 포함).
   - 스트리밍 이벤트: `token`(증분 텍스트), `error`(메시지), `done`(종료)
+  - Ctrl‑C 시 스트림 중단(서버 취소 전파)
 - `mycoder explain <path|symbol>` : 파일/심볼 설명.
 - `mycoder edit --goal "<설명>" [--files ...]` : 패치 제안→미리보기→적용.
 - `mycoder test [--target <pkg|path>]` : 테스트 실행.
 - `mycoder index [--full|--incremental]` : 인덱싱 수행.
+  - 옵션: `--max-files`, `--max-bytes`, `--include '<glob,glob>'`, `--exclude '<glob,glob>'`
+  - `--stream` 사용 시 진행상황 스트리밍(SSE). 이벤트에 따라 `job`, `progress indexed/total`, `completed` 표시
+  - Ctrl‑C 시 진행 스트림 중단 및 서버 취소 전파
 - `mycoder knowledge add <url|file>` : 외부 지식 추가.
 - `mycoder search "<쿼리>"` : 의미+단어 검색 결과 출력.
 - `mycoder plan "<작업>"` : 단계별 계획 생성.
 - `mycoder hooks run` : `make fmt-check && make test && make lint` 실행. `--targets`/`--timeout`/`--verbose` 지원, 실패 시 요약과 힌트(suggestion) 출력.
 - `mycoder projects [list|create]` : 프로젝트 조회/생성(`--name`, `--root`).
 - `mycoder models` : LLM 서버의 `/v1/models` 목록 조회.
+  - 옵션: `--format table|json|raw`(기본 table), `--filter <substr>`, `--color`
 - `mycoder metrics` : 서버 `/metrics` 출력(기본 Prometheus 텍스트, `?format=json` 지원).
+  - 옵션: `--json`(JSON pretty), `--color`(텍스트 모드 키 컬러)
 - `mycoder knowledge add --project <id> --type <code|doc|web> --text "..." [--title ...] [--url ...]`
 - `mycoder knowledge list --project <id>`
 - `mycoder knowledge vet --project <id>`
@@ -31,6 +37,7 @@
     - 스트리밍 요약: `--stream-tail N` 사용 시 종료 후 마지막 N라인만 출력
 - `mycoder fs read|write|patch|delete --project <id> --path <p> [--content ...] [--start N --length N --replace ...]` : 프로젝트 루트 내 파일 조작.
   - 안전장치: `--dry-run`(미리보기), `--yes` 없으면 적용 거부(write/delete/patch)
+  - 대량 변경 감지: `--large-threshold-bytes`(기본 65536) 초과 변경은 차단, `--allow-large`로 우회 가능
 - `mycoder mcp tools` / `mycoder mcp call <tool> --json '<params>'` : MCP 도구 조회/호출.
 
 ## 공통 규칙
