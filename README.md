@@ -163,6 +163,69 @@ mycoder ask --project "$PID" "이 리포의 인덱싱 흐름 설명"
 mycoder knowledge promote-auto --project "$PID" --files "internal/server/server.go" --title "서버 핵심 요약" --pin
 ```
 
+## 예제 출력
+
+### hooks run (성공 사례)
+```bash
+$ mycoder hooks run --project $PID --targets fmt-check,test,lint --timeout 60
+Hooks summary:
+  ✅ fmt-check
+  ✅ test
+  ✅ lint
+```
+
+### hooks run (실패 + 힌트)
+```bash
+$ mycoder hooks run --project $PID --targets fmt-check,test
+Hooks summary:
+  ✅ fmt-check
+  ❌ test
+    Hint: 실패한 테스트를 확인하세요: go test ./... -v (필요 시 -run 으로 타겟팅)
+    [test] go test ./...
+    --- FAIL: TestSomething (0.00s)
+    ...
+    FAIL
+    exit status 1
+```
+
+### fs 안전장치(`--dry-run`/`--yes`)
+```bash
+$ mycoder fs write --project $PID --path path/to/file.txt --content "hello"
+confirmation required: pass --yes to apply or use --dry-run
+
+$ mycoder fs write --project $PID --path path/to/file.txt --content "hello" --dry-run
+[dry-run] write path/to/file.txt (len=5)
+
+$ mycoder fs write --project $PID --path path/to/file.txt --content "hello" --yes
+{"ok":true}
+
+$ mycoder fs patch --project $PID --path path/to/file.txt --start 0 --length 5 --replace "hi" --dry-run
+[dry-run] patch path/to/file.txt start=0 length=5 replace_len=2
+```
+
+### exec (비스트리밍) 출력 요약
+```bash
+# 마지막 50라인/4096바이트만 출력
+$ mycoder exec --project $PID --tail 50 --max-bytes 4096 -- -- make test
+... (마지막 50라인 중 4096바이트)
+[limit] output truncated by server   # 서버 측 64KiB 캡을 넘긴 경우 표시
+```
+
+### exec (스트리밍) 요약 + 전송량 제한
+```bash
+# 스트리밍 중에는 버퍼링하고 종료 후 마지막 100라인을 요약 출력
+$ mycoder exec --project $PID --stream --stream-tail 100 -- -- bash -lc 'seq 1 100000'
+---- stdout (last 100 lines) ----
+...
+[limit] output truncated by server   # 서버가 64KiB 초과로 스트림을 제한한 경우
+```
+
+### chat (스트리밍) 이벤트 처리
+```bash
+$ mycoder chat --project $PID "요약해줘: internal/server/server.go 변경 사항"
+...토큰이 스트리밍으로 출력...
+```
+
 ## 로드맵(요약)
 - 하이브리드 검색(BM25+벡터)
 - 코드/문서 청킹 개선, 심볼 그래프

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
@@ -110,6 +111,35 @@ func newMetrics() *metricsCollector {
 }
 
 var metrics = newMetrics()
+
+// sampling for metrics recording (0..1)
+var (
+	metricsSampleRate = 1.0
+	samplerOnce       sync.Once
+)
+
+func shouldSample() bool {
+	samplerOnce.Do(func() {
+		if v := os.Getenv("MYCODER_METRICS_SAMPLE_RATE"); v != "" {
+			if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 && f <= 1 {
+				metricsSampleRate = f
+			}
+		}
+		rand.Seed(time.Now().UnixNano())
+	})
+	if metricsSampleRate >= 1 {
+		return true
+	}
+	return rand.Float64() < metricsSampleRate
+}
+
+// normalizePath collapses variable path segments for metrics labels
+func normalizePath(p string) string {
+	if strings.HasPrefix(p, "/index/jobs/") {
+		return "/index/jobs/:id"
+	}
+	return p
+}
 
 func (a *API) mux() *http.ServeMux {
 	mux := http.NewServeMux()
@@ -246,14 +276,17 @@ func logMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(rec, r)
 		dur := time.Since(start)
 		fmt.Fprintf(os.Stdout, "%s %s %s %d\n", r.Method, r.URL.Path, dur, rec.status)
-		// metrics: requests and durations
-		mkey := r.Method + "|" + r.URL.Path + "|" + fmt.Sprintf("%d", rec.status)
-		dkey := r.Method + "|" + r.URL.Path
-		metrics.mu.Lock()
-		metrics.reqTotal[mkey]++
-		metrics.durSum[dkey] += dur.Seconds()
-		metrics.durCount[dkey]++
-		metrics.mu.Unlock()
+		// metrics: requests and durations (with label normalization + sampling)
+		if shouldSample() {
+			path := normalizePath(r.URL.Path)
+			mkey := r.Method + "|" + path + "|" + fmt.Sprintf("%d", rec.status)
+			dkey := r.Method + "|" + path
+			metrics.mu.Lock()
+			metrics.reqTotal[mkey]++
+			metrics.durSum[dkey] += dur.Seconds()
+			metrics.durCount[dkey]++
+			metrics.mu.Unlock()
+		}
 	})
 }
 
@@ -729,16 +762,29 @@ func hintFromOutput(target, output string) string {
 	lo := strings.ToLower(output)
 	switch target {
 	case "fmt-check":
-		if strings.Contains(lo, "files need formatting") || strings.Contains(lo, "gofmt") {
+		if strings.Contains(lo, "files need formatting") || strings.Contains(lo, "gofmt") || strings.Contains(lo, "formatted") {
 			return "포맷팅을 적용하세요: make fmt"
 		}
 	case "test":
-		if strings.Contains(lo, "fail") || strings.Contains(lo, "error") {
-			return "실패한 테스트를 확인하세요: go test ./... -v"
+		if strings.Contains(lo, "--- fail") || strings.Contains(lo, "fail\t") || strings.Contains(lo, "error") || strings.Contains(lo, "exit status") {
+			// common go test issues
+			if strings.Contains(lo, "panic:") {
+				return "패닉 발생 원인을 확인하세요. 스택트레이스를 따라 수정 후 go test ./... -v"
+			}
+			if strings.Contains(lo, "data race") {
+				return "데이터 레이스가 감지되었습니다: go test -race ./... 로 재현하고 동기화를 수정하세요"
+			}
+			return "실패한 테스트를 확인하세요: go test ./... -v (필요 시 -run 으로 타겟팅)"
 		}
 	case "lint":
-		if strings.Contains(lo, "vet") || strings.Contains(lo, "warning") || strings.Contains(lo, "error") {
-			return "린트 경고를 수정하세요: go vet ./..."
+		if strings.Contains(lo, "vet") || strings.Contains(lo, "warning") || strings.Contains(lo, "error") || strings.Contains(lo, "undeclared name") || strings.Contains(lo, "unused ") {
+			if strings.Contains(lo, "undeclared name") || strings.Contains(lo, "cannot find package") {
+				return "컴파일 오류(식별자/패키지)를 먼저 해결하세요: go build ./... 후 go vet ./..."
+			}
+			if strings.Contains(lo, "unused ") {
+				return "미사용 코드 정리 필요: 사용하지 않는 변수/임포트를 제거하세요 (go vet ./..., go build ./...)"
+			}
+			return "린트/정적 분석 경고를 수정하세요: go vet ./..."
 		}
 	}
 	if strings.Contains(lo, "operation not permitted") {
@@ -1162,7 +1208,8 @@ func (a *API) handleChat(w http.ResponseWriter, r *http.Request) {
 		for {
 			delta, done, err := st.Recv()
 			if err != nil {
-				fmt.Fprintf(w, "event: error\n\n")
+				fmt.Fprintf(w, "event: error\n")
+				fmt.Fprintf(w, "data: %s\n\n", jsonEscape(err.Error()))
 				if fl != nil {
 					fl.Flush()
 				}
@@ -1171,7 +1218,6 @@ func (a *API) handleChat(w http.ResponseWriter, r *http.Request) {
 			if delta != "" {
 				fmt.Fprintf(w, "event: token\n")
 				fmt.Fprintf(w, "data: %s\n\n", jsonEscape(delta))
-				// approximate token count by bytes/4 (stub)
 				metrics.mu.Lock()
 				metrics.chatTokens += len(delta) / 4
 				metrics.mu.Unlock()

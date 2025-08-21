@@ -100,6 +100,64 @@ func TestToolsHooksStopsOnFailure(t *testing.T) {
 	}
 }
 
+func TestToolsHooksFmtSuggestion(t *testing.T) {
+	dir := t.TempDir()
+	mf := "fmt-check:\n\t@echo Files need formatting: a.go\n\t@exit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "Makefile"), []byte(mf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := store.New()
+	api := NewAPI(st, nil)
+	p := st.CreateProject("demo", dir, nil)
+	mux := api.mux()
+	body, _ := json.Marshal(map[string]any{"projectID": p.ID, "targets": []string{"fmt-check"}})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/tools/hooks", bytes.NewReader(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d", rr.Code)
+	}
+	var res map[string]struct {
+		Ok                 bool
+		Output, Suggestion string
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &res)
+	if res["fmt-check"].Ok {
+		t.Fatalf("expected fmt-check to fail")
+	}
+	if !strings.Contains(res["fmt-check"].Suggestion, "make fmt") {
+		t.Fatalf("expected make fmt suggestion: %v", res["fmt-check"].Suggestion)
+	}
+}
+
+func TestToolsHooksLintSuggestion(t *testing.T) {
+	dir := t.TempDir()
+	mf := "lint:\n\t@echo vet: undeclared name: X\n\t@exit 2\n"
+	if err := os.WriteFile(filepath.Join(dir, "Makefile"), []byte(mf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := store.New()
+	api := NewAPI(st, nil)
+	p := st.CreateProject("demo", dir, nil)
+	mux := api.mux()
+	body, _ := json.Marshal(map[string]any{"projectID": p.ID, "targets": []string{"lint"}})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/tools/hooks", bytes.NewReader(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d", rr.Code)
+	}
+	var res map[string]struct {
+		Ok                 bool
+		Output, Suggestion string
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &res)
+	if res["lint"].Ok {
+		t.Fatalf("expected lint to fail")
+	}
+	if !strings.Contains(res["lint"].Suggestion, "go vet") {
+		t.Fatalf("expected vet suggestion: %v", res["lint"].Suggestion)
+	}
+}
+
 func TestToolsHooksEnvWhitelist(t *testing.T) {
 	dir := t.TempDir()
 	mf := "show:\n\t@echo GOFLAGS=$$GOFLAGS\n"

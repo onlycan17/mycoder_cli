@@ -4,6 +4,7 @@
 - `mycoder chat` : 대화형 모드(SSE 스트리밍, 인용 표시).
 - `mycoder ask "<질문>" [--project <id>] [--k 5]` : 일회성 Q&A(RAG 컨텍스트 포함).
 - `mycoder chat "<프롬프트>" [--project <id>] [--k 5]` : 스트리밍 대화(RAG 컨텍스트 포함).
+  - 스트리밍 이벤트: `token`(증분 텍스트), `error`(메시지), `done`(종료)
 - `mycoder explain <path|symbol>` : 파일/심볼 설명.
 - `mycoder edit --goal "<설명>" [--files ...]` : 패치 제안→미리보기→적용.
 - `mycoder test [--target <pkg|path>]` : 테스트 실행.

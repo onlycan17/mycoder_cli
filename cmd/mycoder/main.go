@@ -258,16 +258,34 @@ func chatCmd(args []string) {
 	}
 	defer resp.Body.Close()
 	rd := bufio.NewScanner(resp.Body)
+	lastEvent := ""
+	exitCode := 0
+	_ = exitCode
 	for rd.Scan() {
 		line := rd.Text()
+		if strings.HasPrefix(line, "event:") {
+			lastEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
 		if strings.HasPrefix(line, "data:") {
 			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if data == "[DONE]" {
-				break
+			switch lastEvent {
+			case "token":
+				fmt.Print(data)
+			case "error":
+				if data != "" {
+					fmt.Fprintln(os.Stderr, data)
+				}
+			case "done":
+				fmt.Println()
+				return
+			default:
+				// fallback: print raw data lines
+				fmt.Print(data)
 			}
-			fmt.Print(data)
 		}
 	}
+	// if stream closed without explicit done, just newline for cleanliness
 	fmt.Println()
 }
 

@@ -8,7 +8,10 @@
 ## POST /chat (SSE)
 - 요청: `{ messages:[{role,content}], model?, stream?, temperature?, projectID?, retrieval?:{k} }`
 - 응답:
-  - `stream=true`: SSE `event: token` + `data: <text>`, 마지막 `event: done`
+  - `stream=true`: SSE 이벤트 스트림
+    - `token`: `data: <text>` (증분 토큰)
+    - `error`: `data: <message>` (에러 메시지)
+    - `done`: 종료 이벤트
   - `stream=false`: `{ content: string }`
   - 동작: `projectID`가 있으면 RAG 검색 결과를 시스템 컨텍스트로 주입하여 인용 가능한 답변 유도
 
@@ -64,6 +67,7 @@
 - 요청: `{ projectID, targets?:string[], timeoutSec?:number, env?:{[k:string]:string} }`
 - 동작: 프로젝트 루트에서 `make <target>` 순차 실행(기본 `fmt-check`, `test`, `lint`), 실패 시 즉시 중단. `env`는 화이트리스트 키만 반영(예: `GOFLAGS`).
 - 응답: `{ <target>:{ok:boolean, output:string, suggestion?:string}, ... }`
+  - suggestion: 출력 패턴 기반 가이드(예: 포맷 실패→`make fmt`, 테스트 실패→`go test ./... -v`, lint 오류→`go vet ./...`)
 
 ## 헬스/메트릭
 - `GET /healthz` → `200 OK`
@@ -71,6 +75,9 @@
   - 기본: Prometheus 텍스트 포맷(`text/plain; version=0.0.4`).
   - JSON: `?format=json` 또는 `Accept: application/json` 시 `{ projects, documents, jobs, knowledge }` 반환.
   - 포함 지표: `mycoder_projects`, `mycoder_documents`, `mycoder_jobs`, `mycoder_knowledge`, `mycoder_build_info{version,commit}`
+  - HTTP 지표: `mycoder_http_requests_total{method,path,status}`, `mycoder_http_request_duration_seconds_{sum,count}{method,path}`
+  - 라벨 정규화: 경로 변수는 템플릿으로 축약됨(예: `/index/jobs/abc` → `/index/jobs/:id`)
+  - 샘플링: `MYCODER_METRICS_SAMPLE_RATE`(0.0~1.0, 기본 1.0)로 샘플링 비율 조절
 - 백그라운드 큐레이터(옵션): 서버 기동 시 지식 재검증/정리 배치가 주기적으로 실행(`MYCODER_CURATOR_DISABLE`로 비활성화, `MYCODER_CURATOR_INTERVAL`, `MYCODER_KNOWLEDGE_MIN_TRUST`로 파라미터 제어)
 
 ## 파일시스템 API
