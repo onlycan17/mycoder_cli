@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -22,6 +23,7 @@ import (
 	oai "mycoder/internal/llm/openai"
 	"mycoder/internal/models"
 	"mycoder/internal/store"
+	"mycoder/internal/version"
 	"strconv"
 )
 
@@ -59,6 +61,29 @@ type API struct {
 
 func NewAPI(s Store, p llm.ChatProvider) *API { return &API{store: s, llm: p} }
 
+// lightweight in-process metrics collector
+type metricsCollector struct {
+	mu sync.Mutex
+	// counters keyed by method|path|status
+	reqTotal map[string]int
+	// duration sum/count keyed by method|path
+	durSum   map[string]float64
+	durCount map[string]int
+	// chat-related
+	chatRequests int
+	chatTokens   int
+}
+
+func newMetrics() *metricsCollector {
+	return &metricsCollector{
+		reqTotal: make(map[string]int),
+		durSum:   make(map[string]float64),
+		durCount: make(map[string]int),
+	}
+}
+
+var metrics = newMetrics()
+
 func (a *API) mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -84,6 +109,8 @@ func (a *API) mux() *http.ServeMux {
 	mux.HandleFunc("/knowledge/reverify", a.handleKnowledgeReverify)
 	mux.HandleFunc("/knowledge/gc", a.handleKnowledgeGC)
 	mux.HandleFunc("/knowledge/promote/auto", a.handleKnowledgePromoteAuto)
+	// tools/hooks
+	mux.HandleFunc("/tools/hooks", a.handleToolsHooks)
 	return mux
 }
 
@@ -165,12 +192,41 @@ func Run(addr string) error {
 	}
 }
 
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	nbytes int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	sr.status = code
+	sr.ResponseWriter.WriteHeader(code)
+}
+
+func (sr *statusRecorder) Write(b []byte) (int, error) {
+	if sr.status == 0 {
+		sr.status = http.StatusOK
+	}
+	n, err := sr.ResponseWriter.Write(b)
+	sr.nbytes += n
+	return n, err
+}
+
 func logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// minimal access log (stdout)
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		fmt.Fprintf(os.Stdout, "%s %s %s\n", r.Method, r.URL.Path, time.Since(start))
+		rec := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(rec, r)
+		dur := time.Since(start)
+		fmt.Fprintf(os.Stdout, "%s %s %s %d\n", r.Method, r.URL.Path, dur, rec.status)
+		// metrics: requests and durations
+		mkey := r.Method + "|" + r.URL.Path + "|" + fmt.Sprintf("%d", rec.status)
+		dkey := r.Method + "|" + r.URL.Path
+		metrics.mu.Lock()
+		metrics.reqTotal[mkey]++
+		metrics.durSum[dkey] += dur.Seconds()
+		metrics.durCount[dkey]++
+		metrics.mu.Unlock()
 	})
 }
 
@@ -301,7 +357,74 @@ func (a *API) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, http.StatusOK, a.store.Stats())
+	// Content negotiation: default to Prometheus text exposition.
+	// Use JSON when explicitly requested via query or Accept header.
+	format := strings.ToLower(r.URL.Query().Get("format"))
+	accept := r.Header.Get("Accept")
+	if format == "json" || strings.Contains(accept, "application/json") {
+		writeJSON(w, http.StatusOK, a.store.Stats())
+		return
+	}
+
+	st := a.store.Stats()
+	val := func(key string) int {
+		if v, ok := st[key]; ok {
+			return v
+		}
+		return 0
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	// minimal exposition format
+	// project/doc/job/knowledge gauges
+	io.WriteString(w, "# HELP mycoder_projects Number of projects.\n")
+	io.WriteString(w, "# TYPE mycoder_projects gauge\n")
+	io.WriteString(w, fmt.Sprintf("mycoder_projects %d\n", val("projects")))
+
+	io.WriteString(w, "# HELP mycoder_documents Number of indexed documents.\n")
+	io.WriteString(w, "# TYPE mycoder_documents gauge\n")
+	io.WriteString(w, fmt.Sprintf("mycoder_documents %d\n", val("documents")))
+
+	io.WriteString(w, "# HELP mycoder_jobs Number of index jobs.\n")
+	io.WriteString(w, "# TYPE mycoder_jobs gauge\n")
+	io.WriteString(w, fmt.Sprintf("mycoder_jobs %d\n", val("jobs")))
+
+	io.WriteString(w, "# HELP mycoder_knowledge Number of knowledge items.\n")
+	io.WriteString(w, "# TYPE mycoder_knowledge gauge\n")
+	io.WriteString(w, fmt.Sprintf("mycoder_knowledge %d\n", val("knowledge")))
+
+	// http request metrics (counters and duration sum/count)
+	metrics.mu.Lock()
+	// requests total
+	for key, v := range metrics.reqTotal {
+		parts := strings.Split(key, "|")
+		if len(parts) == 3 {
+			method, path, status := parts[0], parts[1], parts[2]
+			io.WriteString(w, "# TYPE mycoder_http_requests_total counter\n")
+			io.WriteString(w, fmt.Sprintf("mycoder_http_requests_total{method=\"%s\",path=\"%s\",status=\"%s\"} %d\n", method, path, status, v))
+		}
+	}
+	// durations
+	for key, sum := range metrics.durSum {
+		cnt := metrics.durCount[key]
+		parts := strings.Split(key, "|")
+		if len(parts) == 2 {
+			method, path := parts[0], parts[1]
+			io.WriteString(w, "# TYPE mycoder_http_request_duration_seconds summary\n")
+			io.WriteString(w, fmt.Sprintf("mycoder_http_request_duration_seconds_sum{method=\"%s\",path=\"%s\"} %f\n", method, path, sum))
+			io.WriteString(w, fmt.Sprintf("mycoder_http_request_duration_seconds_count{method=\"%s\",path=\"%s\"} %d\n", method, path, cnt))
+		}
+	}
+	// chat metrics stubs
+	io.WriteString(w, "# TYPE mycoder_chat_requests_total counter\n")
+	io.WriteString(w, fmt.Sprintf("mycoder_chat_requests_total %d\n", metrics.chatRequests))
+	io.WriteString(w, "# TYPE mycoder_chat_stream_tokens_total counter\n")
+	io.WriteString(w, fmt.Sprintf("mycoder_chat_stream_tokens_total %d\n", metrics.chatTokens))
+	metrics.mu.Unlock()
+
+	// build info
+	io.WriteString(w, "# HELP mycoder_build_info Build information.\n")
+	io.WriteString(w, "# TYPE mycoder_build_info gauge\n")
+	io.WriteString(w, fmt.Sprintf("mycoder_build_info{version=\"%s\",commit=\"%s\"} 1\n", version.Version, version.Commit))
 }
 
 // Knowledge handlers
@@ -511,6 +634,93 @@ func (a *API) handleKnowledgePromoteAuto(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, k)
+}
+
+// POST /tools/hooks: run project hooks (fmt-check, test, lint) in project root.
+func (a *API) handleToolsHooks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ProjectID  string            `json:"projectID"`
+		Targets    []string          `json:"targets"`
+		TimeoutSec int               `json:"timeoutSec"`
+		Env        map[string]string `json:"env"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	p, ok := a.store.GetProject(req.ProjectID)
+	if !ok {
+		http.Error(w, "project not found", http.StatusBadRequest)
+		return
+	}
+	targets := req.Targets
+	if len(targets) == 0 {
+		targets = []string{"fmt-check", "test", "lint"}
+	}
+	type result struct {
+		Ok         bool   `json:"ok"`
+		Output     string `json:"output"`
+		Suggestion string `json:"suggestion,omitempty"`
+	}
+	out := map[string]result{}
+	timeout := 60 * time.Second
+	if req.TimeoutSec > 0 {
+		timeout = time.Duration(req.TimeoutSec) * time.Second
+	}
+	for _, t := range targets {
+		// use system make; run each target separately
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		cmd := exec.CommandContext(ctx, "/bin/zsh", "-lc", "make "+shellQuote(t))
+		cmd.Dir = p.RootPath
+		// apply env whitelist
+		allowed := map[string]bool{"GOFLAGS": true}
+		env := os.Environ()
+		for k, v := range req.Env {
+			if allowed[k] {
+				env = append(env, fmt.Sprintf("%s=%s", k, v))
+			}
+		}
+		cmd.Env = env
+		b, err := cmd.CombinedOutput()
+		cancel()
+		ok := err == nil
+		rstr := string(b)
+		out[t] = result{Ok: ok, Output: rstr, Suggestion: hintFromOutput(t, rstr)}
+		if !ok {
+			// stop on first failure to follow gate behavior
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func hintFromOutput(target, output string) string {
+	lo := strings.ToLower(output)
+	switch target {
+	case "fmt-check":
+		if strings.Contains(lo, "files need formatting") || strings.Contains(lo, "gofmt") {
+			return "포맷팅을 적용하세요: make fmt"
+		}
+	case "test":
+		if strings.Contains(lo, "fail") || strings.Contains(lo, "error") {
+			return "실패한 테스트를 확인하세요: go test ./... -v"
+		}
+	case "lint":
+		if strings.Contains(lo, "vet") || strings.Contains(lo, "warning") || strings.Contains(lo, "error") {
+			return "린트 경고를 수정하세요: go vet ./..."
+		}
+	}
+	if strings.Contains(lo, "operation not permitted") {
+		return "권한 문제로 실패했습니다. 캐시/권한을 확인하거나 별도 환경에서 실행하세요."
+	}
+	if strings.Contains(lo, "timeout") || strings.Contains(lo, "signal: killed") {
+		return "타임아웃이 발생했습니다. --timeout 값을 늘려보세요."
+	}
+	return ""
 }
 
 // FS handlers (project-root confined)
@@ -834,6 +1044,11 @@ func (a *API) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		msgs = a.withRAGContext(msgs, req.ProjectID, k)
 	}
+	// metrics: count chat requests
+	metrics.mu.Lock()
+	metrics.chatRequests++
+	metrics.mu.Unlock()
+
 	st, err := a.llm.Chat(r.Context(), req.Model, msgs, req.Stream, req.Temperature)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -856,6 +1071,10 @@ func (a *API) handleChat(w http.ResponseWriter, r *http.Request) {
 			if delta != "" {
 				fmt.Fprintf(w, "event: token\n")
 				fmt.Fprintf(w, "data: %s\n\n", jsonEscape(delta))
+				// approximate token count by bytes/4 (stub)
+				metrics.mu.Lock()
+				metrics.chatTokens += len(delta) / 4
+				metrics.mu.Unlock()
 				if fl != nil {
 					fl.Flush()
 				}
@@ -881,6 +1100,10 @@ func (a *API) handleChat(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	// approximate token count for non-streaming
+	metrics.mu.Lock()
+	metrics.chatTokens += len(buf.String()) / 4
+	metrics.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"content": buf.String()})
 }
 

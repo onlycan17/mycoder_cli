@@ -61,12 +61,16 @@
 - 생성: `{ name, rootPath, ignore?:string[] }` → `{ projectID }`
 
 ## POST /tools/hooks
-- 요청: `{ projectID, targets?:string[] }`
-- 응답: `{ fmt:{ok,output}, lint:{ok,output}, test:{ok,output} }`
+- 요청: `{ projectID, targets?:string[], timeoutSec?:number, env?:{[k:string]:string} }`
+- 동작: 프로젝트 루트에서 `make <target>` 순차 실행(기본 `fmt-check`, `test`, `lint`), 실패 시 즉시 중단. `env`는 화이트리스트 키만 반영(예: `GOFLAGS`).
+- 응답: `{ <target>:{ok:boolean, output:string, suggestion?:string}, ... }`
 
 ## 헬스/메트릭
 - `GET /healthz` → `200 OK`
-- `GET /metrics` → JSON 카운터 `{ projects, documents, jobs }`
+- `GET /metrics`
+  - 기본: Prometheus 텍스트 포맷(`text/plain; version=0.0.4`).
+  - JSON: `?format=json` 또는 `Accept: application/json` 시 `{ projects, documents, jobs, knowledge }` 반환.
+  - 포함 지표: `mycoder_projects`, `mycoder_documents`, `mycoder_jobs`, `mycoder_knowledge`, `mycoder_build_info{version,commit}`
 - 백그라운드 큐레이터(옵션): 서버 기동 시 지식 재검증/정리 배치가 주기적으로 실행(`MYCODER_CURATOR_DISABLE`로 비활성화, `MYCODER_CURATOR_INTERVAL`, `MYCODER_KNOWLEDGE_MIN_TRUST`로 파라미터 제어)
 
 ## 파일시스템 API

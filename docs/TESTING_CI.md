@@ -1,12 +1,17 @@
 # 테스트/CI/후크 정책
 
 ## 게이트(차단 규칙)
-- `make fmt` : `gofmt -s` + `goimports` 적용, 포맷 미준수 시 실패.
-- `make lint` : `golangci-lint` 기본 규칙 + 금지 패턴(동기화 목적의 `time.Sleep` 등).
-- `make test` : 단위/계약/소규모 e2e, CI에서 `-race` 활성화.
+- `make fmt` : `gofmt -s -w` 적용(자동 정리).
+- `make fmt-check` : 포맷 미준수 파일이 있으면 실패.
+- `make lint` : `go vet` 기반의 기본 정적 분석.
+- `make test` : 단위/계약/소규모 e2e.
 
 ## 프리커밋
-- 위 3개 게이트 모두 통과하지 않으면 커밋 차단.
+- 커밋 직전에 `make fmt && make fmt-check && make test && make lint`를 실행하고, 하나라도 실패하면 커밋을 차단.
+- 설치 방법:
+  1) `make hook-install`
+  2) 정상 설치 시 `.git/hooks/pre-commit`가 생성되고 실행 권한이 부여됨.
+  3) 포맷팅으로 변경이 발생하면 훅이 자동으로 스테이징하여 일관성을 유지함.
 
 ## 테스트 전략
 - 단위: 청커/리트리버/플래너/프롬프트 컴포저 테이블 기반 테스트.

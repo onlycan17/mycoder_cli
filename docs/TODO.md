@@ -1,7 +1,7 @@
 # TODO (대분류/중분류/소분류)
 
 ## 현재 작업
- - [ ] pre-commit 훅 구성 및 문서/코드 동기화 체크 추가
+ - [x] 프로메테우스 스타일 `/metrics` 텍스트 포맷 지표 노출(옵션)
 
 ## 완료
 - [x] PRD/아키텍처/RAG/API/데이터모델/CLI/테스트·CI/로드맵 초안 작성
@@ -23,12 +23,12 @@
   - [x] `internal/server/server.go` (기본 /healthz 및 REST 핸들러)
 - 중분류: Makefile/훅/CI
   - [x] `make fmt-check`, `make lint`(go vet), `make test`
-  - [ ] pre-commit 훅 스크립트(게이트 통과 시만 커밋)
+  - [x] pre-commit 훅 스크립트(게이트 통과 시만 커밋)
   - [x] GitHub Actions: CI 워크플로 추가
 - 중분류: 설정/로그/메트릭
   - [ ] `~/.mycoder/config.yaml` 로드(Viper), env override
   - [ ] Zerolog 구조화 로그, 로그 마스킹 유틸
-  - [ ] `/metrics`(Prometheus), 기본 지표 등록
+  - [x] `/metrics`(Prometheus), 기본 지표 등록
 
 ## 대분류: 저장소/데이터 모델
 - 중분류: 스키마/마이그레이션(SQLite+FTS5)
@@ -116,8 +116,10 @@
 
 ## 대분류: 도구(TOOLS)
 - 중분류: 훅 러너
-  - [ ] `make fmt && make test && make lint` 실행/구조화 로그/즉시 중단
-  - [ ] 실패 유형 진단/가이드 메시지
+  - [x] `make fmt-check && make test && make lint` 실행 및 즉시 중단
+  - [ ] 구조화 로그(필드화)/로그 아카이빙
+  - [x] 실패 유형 힌트(suggestion) 기본 제공
+  - [ ] 실패 유형 진단/가이드 고도화
 - 중분류: 패치 적용기
   - [ ] 유니파이드 디프 파서/생성, 컬러 미리보기, 충돌 처리, 롤백
 - 중분류: 파일시스템 도구
@@ -126,7 +128,8 @@
   - [ ] `--dry-run`/`--yes`, 대량 변경 감지/확인 단계
 - 중분류: 터미널 실행기
   - [x] `exec` 기본 POST 실행(프로젝트 루트 cwd, 타임아웃)
-  - [ ] SSE 스트리밍/출력 제한/env 화이트리스트/허용·차단/로그 요약
+  - [x] SSE 스트리밍(`/shell/exec/stream`) 클라이언트/서버 기본 구현
+  - [ ] 출력 제한/env 화이트리스트/허용·차단/로그 요약
 - 중분류: MCP 클라이언트
   - [ ] 도구 목록 조회/스키마 검증/호출
   - [ ] 보안 정책(도메인 허용/토큰 스코프)
@@ -143,8 +146,11 @@
   - [x] `/knowledge`(POST/GET), `/knowledge/vet`(POST)
 - 중분류: FS/쉘/MCP
   - [x] `/fs/read|write|delete`(루트 경계)
+  - [x] `/fs/patch`(바이트 오프셋 기반)
   - [x] `/shell/exec`(기본 POST 실행)
-  - [ ] `/fs/patch`, `/shell/exec` SSE/제한/허용·차단
+  - [x] `/shell/exec/stream`(SSE)
+  - [ ] 쉘/FS 제한/허용·차단 정책, 출력 제한
+  - [x] `/tools/hooks` (프로젝트 훅 실행 API)
   - [ ] `/mcp/tools`, `/mcp/call`
 - 중분류: 에러/검증/보안
   - [ ] 요청 스키마 검증, 에러코드 표준화
@@ -154,10 +160,14 @@
 - 중분류: 기본 명령
   - [x] `mycoder projects`, `mycoder index`, `mycoder search`
   - [x] `mycoder ask`, `mycoder chat`
-  - [ ] `mycoder explain`, `mycoder edit`, `mycoder test`, `mycoder hooks run`
+  - [x] `mycoder hooks run`
+  - [ ] `mycoder explain`, `mycoder edit`, `mycoder test`
 - 중분류: 파일/쉘/MCP 명령
-  - [ ] `mycoder fs read|write|patch|delete`(+ `--dry-run`/`--yes`)
-  - [ ] `mycoder exec -- cmd [args...]`(+ `--timeout`/`--cwd`/`--env`)
+  - [x] `mycoder fs read|write|patch|delete`
+  - [ ] `mycoder fs` 옵션: `--dry-run`/`--yes`
+  - [x] `mycoder exec -- cmd [args...]`(+ `--timeout`)
+  - [x] `mycoder exec --stream`(SSE 소비)
+  - [ ] `mycoder exec` 옵션: `--cwd`/`--env`
   - [ ] `mycoder mcp tools|call`
 - 중분류: 출력/스트리밍
   - [ ] 인용/파일:라인 표시, 컬러 디프, 실패 진단/제안

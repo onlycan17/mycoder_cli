@@ -11,10 +11,10 @@
 - `mycoder knowledge add <url|file>` : 외부 지식 추가.
 - `mycoder search "<쿼리>"` : 의미+단어 검색 결과 출력.
 - `mycoder plan "<작업>"` : 단계별 계획 생성.
-- `mycoder hooks run` : `make fmt && make test && make lint` 실행.
+- `mycoder hooks run` : `make fmt-check && make test && make lint` 실행. `--targets`/`--timeout`/`--verbose` 지원, 실패 시 요약과 힌트(suggestion) 출력.
 - `mycoder projects [list|create]` : 프로젝트 조회/생성(`--name`, `--root`).
 - `mycoder models` : LLM 서버의 `/v1/models` 목록 조회.
-- `mycoder metrics` : 서버 `/metrics` JSON 출력.
+- `mycoder metrics` : 서버 `/metrics` 출력(기본 Prometheus 텍스트, `?format=json` 지원).
 - `mycoder knowledge add --project <id> --type <code|doc|web> --text "..." [--title ...] [--url ...]`
 - `mycoder knowledge list --project <id>`
 - `mycoder knowledge vet --project <id>`
@@ -24,8 +24,9 @@
 - `mycoder knowledge promote-auto --project <id> --files "path/a.go,path/b.go" [--title ...] [--pin]`: 코드 파일 요약 후 자동 승격
 
 ## 파일/터미널/MCP
-- `mycoder exec -- cmd [args...]` : 터미널 명령 실행(SSE 스트리밍, `--timeout`, `--cwd`, `--env K=V`, `--no-tty`).
-- `mycoder fs read <path>` / `write <path>` / `delete <path>` / `patch <path>` : 프로젝트 루트 내 파일 조작(`--dry-run`, `--yes`).
+- `mycoder exec -- -- <cmd> [args...]` : 터미널 명령 실행(기본 비스트리밍, `--project`, `--timeout` 지원).
+  - 스트리밍: `mycoder exec --project <id> --stream -- -- <cmd> [args...]` (SSE: `stdout|stderr|exit`)
+- `mycoder fs read|write|patch|delete --project <id> --path <p> [--content ...] [--start N --length N --replace ...]` : 프로젝트 루트 내 파일 조작.
 - `mycoder mcp tools` / `mycoder mcp call <tool> --json '<params>'` : MCP 도구 조회/호출.
 
 ## 공통 규칙

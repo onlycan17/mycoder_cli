@@ -45,8 +45,14 @@ func main() {
 		modelsCmd(os.Args[2:])
 	case "metrics":
 		metricsCmd(os.Args[2:])
+	case "hooks":
+		hooksCmd(os.Args[2:])
+	case "exec":
+		execCmd(os.Args[2:])
 	case "knowledge":
 		knowledgeCmd(os.Args[2:])
+	case "fs":
+		fsCmd(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -74,6 +80,8 @@ func usage() {
 	fmt.Println("  mycoder models")
 	fmt.Println("  mycoder metrics")
 	fmt.Println("  mycoder knowledge [add|list|vet|promote|reverify|gc]")
+	fmt.Println("  mycoder fs [read|write|delete|patch] --project <id> --path <p> [--content ...] [--start N --length N --replace ...]")
+	fmt.Println("  mycoder exec -- -- <cmd> [args...]")
 	fmt.Println("  mycoder <command> (coming soon): explain | edit | test | hooks | fs | exec | mcp")
 }
 
@@ -442,4 +450,254 @@ func toJSONStringArray(csv string) string {
 		parts[i] = fmt.Sprintf("%q", strings.TrimSpace(parts[i]))
 	}
 	return strings.Join(parts, ",")
+}
+
+func fsCmd(args []string) {
+	if len(args) == 0 {
+		fmt.Println("usage: mycoder fs [read|write|delete|patch] --project <id> --path <p> [--content ...] [--start N --length N --replace ...]")
+		os.Exit(1)
+	}
+	sub := args[0]
+	switch sub {
+	case "read":
+		fs := flag.NewFlagSet("fs read", flag.ExitOnError)
+		project := fs.String("project", "", "project ID")
+		path := fs.String("path", "", "path")
+		_ = fs.Parse(args[1:])
+		if *project == "" || *path == "" {
+			fmt.Println("--project and --path required")
+			os.Exit(1)
+		}
+		body := fmt.Sprintf(`{"projectID":"%s","path":"%s"}`, *project, *path)
+		resp, err := http.Post(serverURL()+"/fs/read", "application/json", strings.NewReader(body))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		io.Copy(os.Stdout, resp.Body)
+	case "write":
+		fs := flag.NewFlagSet("fs write", flag.ExitOnError)
+		project := fs.String("project", "", "project ID")
+		path := fs.String("path", "", "path")
+		content := fs.String("content", "", "content")
+		_ = fs.Parse(args[1:])
+		if *project == "" || *path == "" {
+			fmt.Println("--project and --path required")
+			os.Exit(1)
+		}
+		body := fmt.Sprintf(`{"projectID":"%s","path":"%s","content":%q}`, *project, *path, *content)
+		resp, err := http.Post(serverURL()+"/fs/write", "application/json", strings.NewReader(body))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		io.Copy(os.Stdout, resp.Body)
+	case "delete":
+		fs := flag.NewFlagSet("fs delete", flag.ExitOnError)
+		project := fs.String("project", "", "project ID")
+		path := fs.String("path", "", "path")
+		_ = fs.Parse(args[1:])
+		if *project == "" || *path == "" {
+			fmt.Println("--project and --path required")
+			os.Exit(1)
+		}
+		body := fmt.Sprintf(`{"projectID":"%s","path":"%s"}`, *project, *path)
+		resp, err := http.Post(serverURL()+"/fs/delete", "application/json", strings.NewReader(body))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		io.Copy(os.Stdout, resp.Body)
+	case "patch":
+		fs := flag.NewFlagSet("fs patch", flag.ExitOnError)
+		project := fs.String("project", "", "project ID")
+		path := fs.String("path", "", "path")
+		start := fs.Int("start", 0, "byte start")
+		length := fs.Int("length", 0, "byte length")
+		replace := fs.String("replace", "", "replacement text")
+		_ = fs.Parse(args[1:])
+		if *project == "" || *path == "" {
+			fmt.Println("--project and --path required")
+			os.Exit(1)
+		}
+		body := fmt.Sprintf(`{"projectID":"%s","path":"%s","hunks":[{"start":%d,"length":%d,"replace":%q}]}`, *project, *path, *start, *length, *replace)
+		resp, err := http.Post(serverURL()+"/fs/patch", "application/json", strings.NewReader(body))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		io.Copy(os.Stdout, resp.Body)
+	default:
+		fmt.Println("usage: mycoder fs [read|write|delete|patch] --project <id> --path <p> [--content ...] [--start N --length N --replace ...]")
+		os.Exit(1)
+	}
+}
+
+func execCmd(args []string) {
+	fs := flag.NewFlagSet("exec", flag.ExitOnError)
+	project := fs.String("project", "", "project ID")
+	timeout := fs.Int("timeout", 30, "timeout in seconds")
+	stream := fs.Bool("stream", false, "stream output (SSE)")
+	_ = fs.Parse(args)
+	rest := fs.Args()
+	if *project == "" || len(rest) == 0 {
+		fmt.Println("usage: mycoder exec --project <id> [--timeout 30] [--stream] -- <cmd> [args...]")
+		os.Exit(1)
+	}
+	cmd := rest[0]
+	var argv []string
+	if len(rest) > 1 {
+		argv = rest[1:]
+	}
+	// build JSON body
+	body := struct {
+		ProjectID string   `json:"projectID"`
+		Cmd       string   `json:"cmd"`
+		Args      []string `json:"args"`
+		Timeout   int      `json:"timeoutSec"`
+	}{ProjectID: *project, Cmd: cmd, Args: argv, Timeout: *timeout}
+	b, _ := json.Marshal(body)
+	if *stream {
+		req, _ := http.NewRequest(http.MethodPost, serverURL()+"/shell/exec/stream", strings.NewReader(string(b)))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		rd := bufio.NewScanner(resp.Body)
+		lastEvent := ""
+		exitCode := 0
+		for rd.Scan() {
+			line := rd.Text()
+			if strings.HasPrefix(line, "event:") {
+				lastEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+				continue
+			}
+			if strings.HasPrefix(line, "data:") {
+				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				switch lastEvent {
+				case "stdout":
+					fmt.Println(data)
+				case "stderr":
+					fmt.Fprintln(os.Stderr, data)
+				case "exit":
+					fmt.Sscanf(data, "%d", &exitCode)
+				}
+			}
+		}
+		if exitCode != 0 {
+			os.Exit(exitCode)
+		}
+		return
+	}
+	resp, err := http.Post(serverURL()+"/shell/exec", "application/json", strings.NewReader(string(b)))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	var res struct {
+		ExitCode int    `json:"exitCode"`
+		Output   string `json:"output"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		_, _ = io.Copy(os.Stdout, resp.Body)
+		return
+	}
+	fmt.Print(res.Output)
+	if res.ExitCode != 0 {
+		os.Exit(res.ExitCode)
+	}
+}
+
+func hooksCmd(args []string) {
+	if len(args) == 0 || args[0] != "run" {
+		fmt.Println("usage: mycoder hooks run [--project <id>] [--targets fmt-check,test,lint] [--timeout 60] [--verbose]")
+		os.Exit(1)
+	}
+	fs := flag.NewFlagSet("hooks run", flag.ExitOnError)
+	project := fs.String("project", "", "project ID")
+	targets := fs.String("targets", "", "comma-separated targets (fmt-check,test,lint)")
+	timeout := fs.Int("timeout", 60, "timeout in seconds per target")
+	verbose := fs.Bool("verbose", false, "print each target output")
+	_ = fs.Parse(args[1:])
+	if *project == "" {
+		fmt.Println("--project required")
+		os.Exit(1)
+	}
+	body := fmt.Sprintf(`{"projectID":"%s","targets":[%s],"timeoutSec":%d}`, *project, toJSONStringArray(*targets), *timeout)
+	resp, err := http.Post(serverURL()+"/tools/hooks", "application/json", strings.NewReader(body))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	var res map[string]struct {
+		Ok         bool   `json:"ok"`
+		Output     string `json:"output"`
+		Suggestion string `json:"suggestion"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		// fallback raw
+		_, _ = io.Copy(os.Stdout, resp.Body)
+		return
+	}
+	fmt.Println("Hooks summary:")
+	failed := false
+	// stable order
+	order := []string{"fmt-check", "test", "lint"}
+	for _, k := range order {
+		if v, ok := res[k]; ok {
+			mark := "✅"
+			if !v.Ok {
+				mark = "❌"
+				failed = true
+			}
+			fmt.Printf("  %s %s\n", mark, k)
+			if v.Suggestion != "" {
+				fmt.Printf("    Hint: %s\n", v.Suggestion)
+			}
+			if *verbose || !v.Ok {
+				// indent output
+				for _, line := range strings.Split(v.Output, "\n") {
+					if strings.TrimSpace(line) == "" {
+						continue
+					}
+					fmt.Printf("    %s\n", line)
+				}
+			}
+		}
+	}
+	// print any extra keys not in default order
+	for k, v := range res {
+		if k == "fmt-check" || k == "test" || k == "lint" {
+			continue
+		}
+		mark := "✅"
+		if !v.Ok {
+			mark = "❌"
+			failed = true
+		}
+		fmt.Printf("  %s %s\n", mark, k)
+		if v.Suggestion != "" {
+			fmt.Printf("    Hint: %s\n", v.Suggestion)
+		}
+		if *verbose || !v.Ok {
+			for _, line := range strings.Split(v.Output, "\n") {
+				if strings.TrimSpace(line) == "" {
+					continue
+				}
+				fmt.Printf("    %s\n", line)
+			}
+		}
+	}
+	if failed {
+		os.Exit(1)
+	}
 }
