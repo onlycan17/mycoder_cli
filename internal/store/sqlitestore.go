@@ -824,3 +824,45 @@ func boolToInt(b bool) int {
 	}
 	return 0
 }
+
+// CleanupConversations deletes non-pinned conversations older than ttlDays and their messages/summaries.
+func (s *SQLiteStore) CleanupConversations(ttlDays int) (int, error) {
+	if ttlDays <= 0 {
+		return 0, nil
+	}
+	// select old, non-pinned conversation ids
+	rows, err := s.db.Query(`SELECT id FROM conversations WHERE pinned=0 AND (julianday('now') - julianday(COALESCE(updated_at, created_at))) >= ?`, ttlDays)
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	// delete with transaction
+	return s.cleanupConversationIDs(ids)
+}
+
+func (s *SQLiteStore) cleanupConversationIDs(ids []string) (int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		_, _ = tx.Exec(`DELETE FROM conversation_messages WHERE conv_id=?`, id)
+		_, _ = tx.Exec(`DELETE FROM conversation_summaries WHERE conv_id=?`, id)
+		_, _ = tx.Exec(`DELETE FROM conversations WHERE id=?`, id)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(ids), nil
+}

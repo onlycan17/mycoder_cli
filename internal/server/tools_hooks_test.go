@@ -158,6 +158,93 @@ func TestToolsHooksLintSuggestion(t *testing.T) {
 	}
 }
 
+func TestToolsHooksTestPanicSuggestion(t *testing.T) {
+	dir := t.TempDir()
+	mf := "test:\n\t@echo panic: runtime error\n\t@exit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "Makefile"), []byte(mf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := store.New()
+	api := NewAPI(st, nil)
+	p := st.CreateProject("demo", dir, nil)
+	mux := api.mux()
+	body, _ := json.Marshal(map[string]any{"projectID": p.ID, "targets": []string{"test"}})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/tools/hooks", bytes.NewReader(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d", rr.Code)
+	}
+	var res map[string]struct {
+		Ok                 bool
+		Suggestion, Reason string
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &res)
+	if res["test"].Ok {
+		t.Fatalf("expected test to fail")
+	}
+	if !strings.Contains(res["test"].Suggestion, "패닉") || res["test"].Reason != "panic" {
+		t.Fatalf("expected panic suggestion/reason, got: %+v", res["test"])
+	}
+}
+
+func TestToolsHooksTimeoutSuggestion(t *testing.T) {
+	dir := t.TempDir()
+	mf := "slow:\n\t@sleep 2\n\t@exit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "Makefile"), []byte(mf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := store.New()
+	api := NewAPI(st, nil)
+	p := st.CreateProject("demo", dir, nil)
+	mux := api.mux()
+	body, _ := json.Marshal(map[string]any{"projectID": p.ID, "targets": []string{"slow"}, "timeoutSec": 1})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/tools/hooks", bytes.NewReader(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var res map[string]struct {
+		Ok                 bool
+		Suggestion, Output string
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &res)
+	if res["slow"].Ok {
+		t.Fatalf("expected slow to fail by timeout")
+	}
+	if !strings.Contains(res["slow"].Suggestion, "타임아웃") {
+		t.Fatalf("expected timeout suggestion, got: %s", res["slow"].Suggestion)
+	}
+}
+
+func TestToolsHooksModuleMissingSuggestion(t *testing.T) {
+	dir := t.TempDir()
+	mf := "test:\n\t@echo no required module provides package example.com/missing\n\t@exit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "Makefile"), []byte(mf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := store.New()
+	api := NewAPI(st, nil)
+	p := st.CreateProject("demo", dir, nil)
+	mux := api.mux()
+	body, _ := json.Marshal(map[string]any{"projectID": p.ID, "targets": []string{"test"}})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/tools/hooks", bytes.NewReader(body)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d", rr.Code)
+	}
+	var res map[string]struct {
+		Ok                 bool
+		Suggestion, Reason string
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &res)
+	if res["test"].Ok {
+		t.Fatalf("expected test to fail")
+	}
+	if !strings.Contains(res["test"].Suggestion, "go mod tidy") || res["test"].Reason != "mod-missing" {
+		t.Fatalf("expected module missing suggestion/reason, got: %+v", res["test"])
+	}
+}
+
 func TestToolsHooksEnvWhitelist(t *testing.T) {
 	dir := t.TempDir()
 	mf := "show:\n\t@echo GOFLAGS=$$GOFLAGS\n"

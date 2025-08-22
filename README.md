@@ -71,7 +71,15 @@ make hook-install
   - LM Studio 예: `http://localhost:1234/v1` 또는 사내 LLM 게이트웨이 URL
 - `MYCODER_OPENAI_API_KEY`: 인증 필요 시 API 키
 - `MYCODER_DISABLE_EMBEDDINGS`: `1`이면 임베딩/벡터 검색 비활성화(안전 폴백)
-- `MYCODER_CHAT_MAX_CHARS`: 대화 히스토리 슬라이딩 윈도우 문자 예산(기본 6000). 시스템 메시지는 항상 우선 포함.
+- `MYCODER_EMBED_CACHE_TTL_SEC`: 임베딩 캐시 TTL(초, 기본 3600). `MYCODER_EMBED_CACHE_DISABLE=1`로 캐시 비활성화.
+ - `MYCODER_EMBED_CACHE_GEN`: 임베딩 캐시 세대(값 변경 시 전체 무효화).
+ - `MYCODER_EMBED_CACHE_MAX_ENTRIES`: 임베딩 캐시 최대 엔트리 수(초과 시 오래된 항목 제거).
+ - `MYCODER_CHAT_MAX_CHARS`: 대화 히스토리 슬라이딩 윈도우 문자 예산(기본 6000). 시스템 메시지는 항상 우선 포함.
+- `MYCODER_CHAT_SUMMARY_ENABLE`: `1`이면 대화 길이 초과 시 최근 히스토리를 요약해 system 메시지로 앞에 첨부(결정/근거 유지).
+- `MYCODER_CHAT_SUMMARY_THRESHOLD_CHARS`: 요약 트리거 문자 임계(기본 8000).
+ - `MYCODER_CONV_TTL_DAYS`: 오래된(업데이트 없는) 비핀(conversations.pinned=0) 대화 삭제 TTL(일, 기본 30).
+ - `MYCODER_CONV_CLEAN_INTERVAL`: 대화 정리 주기(기본 24h, 예: `6h`).
+ - `MYCODER_CONV_CLEAN_DISABLE`: 설정 시 대화 정리 잡 비활성화.
 - 큐레이터(자동 재검증/정리) 관련
   - `MYCODER_CURATOR_DISABLE`: 비우면 활성, 값 설정 시 비활성
   - `MYCODER_CURATOR_INTERVAL`: 주기(`10m` 기본)
@@ -147,6 +155,8 @@ make hook-install
 - 빌드 정보
   - `mycoder_build_info{version,commit} 1`
 - JSON 포맷 필요 시 `GET /metrics?format=json`
+ - 추가 카운터
+   - `mycoder_embed_cache_hits_total` / `mycoder_embed_cache_misses_total`
 
 ## 로그(관측)
 - JSON 라인 포맷으로 표준에러(stderr)에 구조화 로그를 출력합니다.

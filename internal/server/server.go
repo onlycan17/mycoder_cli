@@ -84,6 +84,9 @@ func NewAPI(s Store, p llm.ChatProvider) *API {
 		a.emb = e
 	}
 	a.vs = vectorstore.NewFromEnv()
+	if a.emb != nil && os.Getenv("MYCODER_EMBED_CACHE_DISABLE") != "1" {
+		a.emb = newCachingEmbedder(a.emb)
+	}
 	// embedding availability check and env opt-out
 	if os.Getenv("MYCODER_DISABLE_EMBEDDINGS") == "1" {
 		a.emb = nil
@@ -213,6 +216,10 @@ type metricsCollector struct {
 	// chat-related
 	chatRequests int
 	chatTokens   int
+	// embedding cache
+	embedCacheHits   int
+	embedCacheMisses int
+	embedCacheEvict  int
 }
 
 func newMetrics() *metricsCollector {
@@ -352,6 +359,35 @@ func Run(addr string) error {
 				}
 			}
 		}()
+	}
+
+	// optional background conversation cleanup (TTL/pin retention)
+	// Controls:
+	// - MYCODER_CONV_CLEAN_DISABLE: if set, disables cleaner
+	// - MYCODER_CONV_TTL_DAYS: TTL in days for non-pinned conversations (default 30)
+	// - MYCODER_CONV_CLEAN_INTERVAL: interval for cleanup loop (default 24h)
+	if os.Getenv("MYCODER_CONV_CLEAN_DISABLE") == "" {
+		ttlDays := 30
+		if v := os.Getenv("MYCODER_CONV_TTL_DAYS"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				ttlDays = n
+			}
+		}
+		interval := 24 * time.Hour
+		if v := os.Getenv("MYCODER_CONV_CLEAN_INTERVAL"); v != "" {
+			if d, err := time.ParseDuration(v); err == nil && d > 0 {
+				interval = d
+			}
+		}
+		if ss, ok := st.(*store.SQLiteStore); ok && ttlDays > 0 {
+			go func() {
+				t := time.NewTicker(interval)
+				defer t.Stop()
+				for range t.C {
+					_, _ = ss.CleanupConversations(ttlDays)
+				}
+			}()
+		}
 	}
 
 	srv := &http.Server{
@@ -771,6 +807,15 @@ func (a *API) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, fmt.Sprintf("mycoder_chat_requests_total %d\n", metrics.chatRequests))
 	io.WriteString(w, "# TYPE mycoder_chat_stream_tokens_total counter\n")
 	io.WriteString(w, fmt.Sprintf("mycoder_chat_stream_tokens_total %d\n", metrics.chatTokens))
+	io.WriteString(w, "# HELP mycoder_embed_cache_hits_total Embedding cache hits.\n")
+	io.WriteString(w, "# TYPE mycoder_embed_cache_hits_total counter\n")
+	io.WriteString(w, fmt.Sprintf("mycoder_embed_cache_hits_total %d\n", metrics.embedCacheHits))
+	io.WriteString(w, "# HELP mycoder_embed_cache_misses_total Embedding cache misses.\n")
+	io.WriteString(w, "# TYPE mycoder_embed_cache_misses_total counter\n")
+	io.WriteString(w, fmt.Sprintf("mycoder_embed_cache_misses_total %d\n", metrics.embedCacheMisses))
+	io.WriteString(w, "# HELP mycoder_embed_cache_evictions_total Embedding cache evictions (TTL).\n")
+	io.WriteString(w, "# TYPE mycoder_embed_cache_evictions_total counter\n")
+	io.WriteString(w, fmt.Sprintf("mycoder_embed_cache_evictions_total %d\n", metrics.embedCacheEvict))
 	metrics.mu.Unlock()
 
 	// build info
@@ -1040,14 +1085,29 @@ func (a *API) handleToolsHooks(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		b, err := cmd.CombinedOutput()
 		dur := time.Since(start)
+		// capture context error before cancel
+		ctxErr := ctx.Err()
 		cancel()
 		ok := err == nil
 		rstr := string(b)
+		sug := hintFromOutput(t, rstr)
+		reason := detectHookReason(t, rstr, ok)
+		if !ok {
+			// augment with timeout/killed detection
+			if ctxErr == context.DeadlineExceeded || (err != nil && strings.Contains(strings.ToLower(err.Error()), "killed")) {
+				if sug == "" {
+					sug = "타임아웃이 발생했습니다. --timeout 값을 늘려보세요."
+				}
+				if reason == "" {
+					reason = "timeout"
+				}
+			}
+		}
 		out[t] = HooksResult{
 			Ok:         ok,
 			Output:     rstr,
-			Suggestion: hintFromOutput(t, rstr),
-			Reason:     detectHookReason(t, rstr, ok),
+			Suggestion: sug,
+			Reason:     reason,
 			DurationMs: int(dur.Milliseconds()),
 			Lines:      countLines(rstr),
 			Bytes:      len(b),
@@ -1148,15 +1208,24 @@ func hintFromOutput(target, output string) string {
 			if strings.Contains(lo, "data race") {
 				return "데이터 레이스가 감지되었습니다: go test -race ./... 로 재현하고 동기화를 수정하세요"
 			}
+			if strings.Contains(lo, "no go files in") || strings.Contains(lo, "build constraints exclude all go files") {
+				return "테스트 대상이 비어있습니다. 패키지 경로나 빌드 태그를 확인하세요."
+			}
+			if strings.Contains(lo, "no required module provides package") || strings.Contains(lo, "cannot find module providing package") {
+				return "모듈 의존성 누락: go mod tidy 또는 go get 으로 의존성을 정리하세요"
+			}
 			return "실패한 테스트를 확인하세요: go test ./... -v (필요 시 -run 으로 타겟팅)"
 		}
 	case "lint":
-		if strings.Contains(lo, "vet") || strings.Contains(lo, "warning") || strings.Contains(lo, "error") || strings.Contains(lo, "undeclared name") || strings.Contains(lo, "unused ") {
+		if strings.Contains(lo, "vet") || strings.Contains(lo, "warning") || strings.Contains(lo, "error") || strings.Contains(lo, "undeclared name") || strings.Contains(lo, "unused ") || strings.Contains(lo, "golangci-lint") {
 			if strings.Contains(lo, "undeclared name") || strings.Contains(lo, "cannot find package") {
 				return "컴파일 오류(식별자/패키지)를 먼저 해결하세요: go build ./... 후 go vet ./..."
 			}
 			if strings.Contains(lo, "unused ") {
 				return "미사용 코드 정리 필요: 사용하지 않는 변수/임포트를 제거하세요 (go vet ./..., go build ./...)"
+			}
+			if strings.Contains(lo, "ineffassign") || strings.Contains(lo, "deadcode") {
+				return "정적 분석 경고를 수정하세요: 불필요 코드/할당 제거 후 다시 go vet 또는 golangci-lint 실행"
 			}
 			return "린트/정적 분석 경고를 수정하세요: go vet ./..."
 		}
@@ -1166,6 +1235,9 @@ func hintFromOutput(target, output string) string {
 	}
 	if strings.Contains(lo, "timeout") || strings.Contains(lo, "signal: killed") {
 		return "타임아웃이 발생했습니다. --timeout 값을 늘려보세요."
+	}
+	if strings.Contains(lo, "fatal error: runtime: out of memory") {
+		return "메모리 부족으로 실패했습니다. 테스트 병렬도/데이터 크기를 줄이거나 메모리를 확보하세요."
 	}
 	return ""
 }
@@ -1185,9 +1257,21 @@ func detectHookReason(target, output string, ok bool) string {
 		if strings.Contains(output, "--- FAIL") || strings.Contains(output, "FAIL\t") || strings.Contains(lo, "exit status 1") {
 			return "test-fail"
 		}
+		if strings.Contains(lo, "panic:") {
+			return "panic"
+		}
+		if strings.Contains(lo, "data race") {
+			return "race"
+		}
+		if strings.Contains(lo, "no required module provides package") || strings.Contains(lo, "cannot find module providing package") {
+			return "mod-missing"
+		}
 	case "lint":
 		if strings.Contains(lo, "vet:") || strings.Contains(lo, "declared and not used") || strings.Contains(lo, "invalid") {
 			return "vet-issue"
+		}
+		if strings.Contains(lo, "ineffassign") || strings.Contains(lo, "deadcode") || strings.Contains(lo, "golangci-lint") {
+			return "lint-issue"
 		}
 	}
 	// generic
@@ -1641,6 +1725,8 @@ func (a *API) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		msgs = a.withRAGContext(msgs, req.ProjectID, k)
 	}
+	// optional: summarize conversation if too long (map-reduce style pre-summary)
+	msgs = a.maybeSummarize(msgs, req.ProjectID)
 	// metrics: count chat requests
 	metrics.mu.Lock()
 	metrics.chatRequests++
@@ -1994,4 +2080,215 @@ func fenceLangFor(path string) string {
 	default:
 		return ""
 	}
+}
+
+type cachingEmbedder struct {
+	u      llm.Embedder
+	mu     sync.Mutex
+	data   map[string][]float32
+	times  map[string]time.Time
+	ttlSec int
+	gen    string // cache generation namespace for invalidation
+}
+
+func newCachingEmbedder(u llm.Embedder) llm.Embedder {
+	ttl := 3600
+	if v := os.Getenv("MYCODER_EMBED_CACHE_TTL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			ttl = n
+		}
+	}
+	gen := os.Getenv("MYCODER_EMBED_CACHE_GEN")
+	return &cachingEmbedder{u: u, data: make(map[string][]float32), times: make(map[string]time.Time), ttlSec: ttl, gen: gen}
+}
+
+func (c *cachingEmbedder) Embeddings(ctx context.Context, model string, inputs []string) ([][]float32, error) {
+	// check generation bump (env-driven invalidation)
+	if g := os.Getenv("MYCODER_EMBED_CACHE_GEN"); g != c.gen {
+		c.mu.Lock()
+		if g != c.gen { // re-check after lock
+			purged := len(c.data)
+			c.data = make(map[string][]float32)
+			c.times = make(map[string]time.Time)
+			c.gen = g
+			if purged > 0 {
+				metrics.embedCacheEvict += purged
+			}
+		}
+		c.mu.Unlock()
+	}
+	out := make([][]float32, len(inputs))
+	var missIdx []int
+	c.mu.Lock()
+	for i, s := range inputs {
+		key := cacheKey(model, s, c.gen)
+		if v, ok := c.data[key]; ok && len(v) > 0 {
+			// TTL check
+			if c.ttlSec > 0 {
+				if t, ok2 := c.times[key]; ok2 {
+					if time.Since(t) > time.Duration(c.ttlSec)*time.Second {
+						// expired
+						missIdx = append(missIdx, i)
+						metrics.embedCacheEvict++
+						continue
+					}
+				}
+			}
+			out[i] = v
+			metrics.embedCacheHits++
+		} else {
+			missIdx = append(missIdx, i)
+		}
+	}
+	c.mu.Unlock()
+	if len(missIdx) > 0 {
+		req := make([]string, len(missIdx))
+		for j, i := range missIdx {
+			req[j] = inputs[i]
+		}
+		vecs, err := c.u.Embeddings(ctx, model, req)
+		if err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		for j, i := range missIdx {
+			if j < len(vecs) {
+				v := vecs[j]
+				out[i] = v
+				key := cacheKey(model, inputs[i], c.gen)
+				c.data[key] = v
+				c.times[key] = time.Now()
+				metrics.embedCacheMisses++
+			}
+		}
+		// enforce optional max entries
+		if max := cacheMaxEntries(); max > 0 && len(c.data) > max {
+			c.evictOldest(len(c.data) - max)
+		}
+		c.mu.Unlock()
+	}
+	return out, nil
+}
+
+func cacheKey(model, input, gen string) string {
+	if gen != "" {
+		return model + "|" + gen + "|" + input
+	}
+	return model + "|" + input
+}
+
+func cacheMaxEntries() int {
+	if v := os.Getenv("MYCODER_EMBED_CACHE_MAX_ENTRIES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+func (c *cachingEmbedder) evictOldest(n int) {
+	if n <= 0 {
+		return
+	}
+	// find n oldest keys by timestamp (simple O(m) scan)
+	type kv struct {
+		k string
+		t time.Time
+	}
+	items := make([]kv, 0, len(c.times))
+	for k, t := range c.times {
+		items = append(items, kv{k: k, t: t})
+	}
+	// partial selection sort for n oldest
+	for i := 0; i < n && i < len(items); i++ {
+		minIdx := i
+		for j := i + 1; j < len(items); j++ {
+			if items[j].t.Before(items[minIdx].t) {
+				minIdx = j
+			}
+		}
+		items[i], items[minIdx] = items[minIdx], items[i]
+		delete(c.data, items[i].k)
+		delete(c.times, items[i].k)
+		metrics.embedCacheEvict++
+	}
+}
+
+// maybeSummarize generates a brief summary system message if conversation exceeds a size threshold.
+// Controlled by env:
+//
+//	MYCODER_CHAT_SUMMARY_ENABLE=1 to enable (default off)
+//	MYCODER_CHAT_SUMMARY_THRESHOLD_CHARS (default 8000)
+func (a *API) maybeSummarize(messages []llm.Message, projectID string) []llm.Message {
+	if os.Getenv("MYCODER_CHAT_SUMMARY_ENABLE") != "1" || a.llm == nil {
+		return messages
+	}
+	// compute total content size (exclude system)
+	sum := 0
+	for _, m := range messages {
+		if m.Role == llm.RoleSystem {
+			continue
+		}
+		sum += len(m.Content)
+	}
+	thr := 8000
+	if v := os.Getenv("MYCODER_CHAT_SUMMARY_THRESHOLD_CHARS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			thr = n
+		}
+	}
+	if sum <= thr {
+		return messages
+	}
+	// build compact summary prompt from tail portion
+	// include at most last ~6 messages (user/assistant), ignoring system
+	var tail []llm.Message
+	for i := len(messages) - 1; i >= 0 && len(tail) < 6; i-- {
+		if messages[i].Role == llm.RoleSystem {
+			continue
+		}
+		tail = append(tail, messages[i])
+	}
+	// reverse to chronological order
+	for i, j := 0, len(tail)-1; i < j; i, j = i+1, j-1 {
+		tail[i], tail[j] = tail[j], tail[i]
+	}
+	var b strings.Builder
+	b.WriteString("Summarize the following conversation succinctly.\n")
+	b.WriteString("- Preserve key decisions and action items.\n")
+	b.WriteString("- Include file citations if mentioned (path:line-range).\n")
+	b.WriteString("- Korean output if user language is Korean.\n\n")
+	for _, m := range tail {
+		b.WriteString(string(m.Role))
+		b.WriteString(": ")
+		b.WriteString(m.Content)
+		b.WriteString("\n")
+	}
+	prompt := b.String()
+	// call LLM non-streaming with low temperature
+	st, err := a.llm.Chat(context.Background(), os.Getenv("MYCODER_CHAT_MODEL"), []llm.Message{{Role: llm.RoleUser, Content: prompt}}, false, 0.1)
+	if err != nil {
+		return messages
+	}
+	defer st.Close()
+	var sb strings.Builder
+	for {
+		delta, done, e := st.Recv()
+		if e != nil {
+			break
+		}
+		sb.WriteString(delta)
+		if done {
+			break
+		}
+	}
+	summary := strings.TrimSpace(sb.String())
+	if summary == "" {
+		return messages
+	}
+	sys := llm.Message{Role: llm.RoleSystem, Content: "Conversation summary:\n" + summary}
+	out := make([]llm.Message, 0, len(messages)+1)
+	out = append(out, sys)
+	out = append(out, messages...)
+	return out
 }
