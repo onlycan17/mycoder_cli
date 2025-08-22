@@ -58,6 +58,10 @@ func main() {
 		modelsCmd(os.Args[2:])
 	case "metrics":
 		metricsCmd(os.Args[2:])
+	case "explain":
+		explainCmd(os.Args[2:])
+	case "edit":
+		editCmd(os.Args[2:])
 	case "hooks":
 		hooksCmd(os.Args[2:])
 	case "test":
@@ -68,6 +72,8 @@ func main() {
 		knowledgeCmd(os.Args[2:])
 	case "fs":
 		fsCmd(os.Args[2:])
+	case "mcp":
+		mcpCmd(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -97,12 +103,15 @@ func usage() {
 	fmt.Println("  mycoder knowledge [add|list|vet|promote|reverify|gc]")
 	fmt.Println("  mycoder fs [read|write|delete|patch] --project <id> --path <p> [--content ...] [--start N --length N --replace ...]")
 	fmt.Println("  mycoder exec -- -- <cmd> [args...]")
+	fmt.Println("  mycoder explain --project <id> <path|symbol>")
+	fmt.Println("  mycoder edit --project <id> --goal \"<설명>\" [--files a.go,b.go] [--stream]")
+	fmt.Println("  mycoder mcp tools|call --name <tool> --json '<params>'")
 	fmt.Println("  mycoder test --project <id> [--timeout 60] [--verbose]")
-	fmt.Println("  mycoder <command> (coming soon): explain | edit | hooks | fs | exec | mcp")
+	fmt.Println("  mycoder <command> (coming soon): edit | hooks | fs | exec | mcp")
 }
 
 func isKnownStub(cmd string) bool {
-	known := []string{"ask", "chat", "explain", "edit", "hooks", "fs", "exec", "mcp"}
+	known := []string{"ask", "chat", "hooks", "fs", "exec"}
 	for _, k := range known {
 		if strings.EqualFold(k, cmd) {
 			return true
@@ -312,54 +321,78 @@ func chatCmd(args []string) {
 	fs := flag.NewFlagSet("chat", flag.ExitOnError)
 	project := fs.String("project", "", "project ID")
 	k := fs.Int("k", 5, "retrieval top K")
+	retries := fs.Int("retries", 0, "auto-retry times on stream error")
+	tty := fs.Bool("tty", false, "print lightweight stream status to stderr")
 	_ = fs.Parse(args)
 	rest := fs.Args()
 	if len(rest) == 0 {
-		fmt.Println("usage: mycoder chat [--project <id>] [--k 5] \"<prompt>\"")
+		fmt.Println("usage: mycoder chat [--project <id>] [--k 5] [--retries 0] [--tty] \"<prompt>\"")
 		os.Exit(1)
 	}
 	q := strings.Join(rest, " ")
 	body := fmt.Sprintf(`{"messages":[{"role":"user","content":%q}],"stream":true,"projectID":"%s","retrieval":{"k":%d}}`, q, *project, *k)
-	ctx, cancel := signalContext()
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, serverURL()+"/chat", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
-	rd := bufio.NewScanner(resp.Body)
-	lastEvent := ""
-	exitCode := 0
-	_ = exitCode
-	for rd.Scan() {
-		line := rd.Text()
-		if strings.HasPrefix(line, "event:") {
-			lastEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			continue
-		}
-		if strings.HasPrefix(line, "data:") {
-			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			switch lastEvent {
-			case "token":
-				fmt.Print(data)
-			case "error":
-				if data != "" {
-					fmt.Fprintln(os.Stderr, data)
-				}
-			case "done":
-				fmt.Println()
-				return
-			default:
-				// fallback: print raw data lines
-				fmt.Print(data)
+	attempts := *retries + 1
+	for i := 0; i < attempts; i++ {
+		if *tty {
+			if i == 0 {
+				fmt.Fprintln(os.Stderr, "[streaming] starting...")
+			} else {
+				fmt.Fprintf(os.Stderr, "[streaming] retry %d/%d...\n", i, *retries)
 			}
 		}
+		ctx, cancel := signalContext()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, serverURL()+"/chat", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			cancel()
+			if i == attempts-1 {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			continue
+		}
+		rd := bufio.NewScanner(resp.Body)
+		lastEvent := ""
+		for rd.Scan() {
+			line := rd.Text()
+			if strings.HasPrefix(line, "event:") {
+				lastEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+				continue
+			}
+			if strings.HasPrefix(line, "data:") {
+				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				switch lastEvent {
+				case "token":
+					fmt.Print(data)
+				case "error":
+					if data != "" {
+						fmt.Fprintln(os.Stderr, data)
+					}
+				case "done":
+					fmt.Println()
+					resp.Body.Close()
+					cancel()
+					return
+				default:
+					// fallback: print raw data lines
+					fmt.Print(data)
+				}
+			}
+		}
+		// if stream closed without explicit done, decide retry
+		resp.Body.Close()
+		cancel()
+		if err := rd.Err(); err != nil && i < attempts-1 {
+			if *tty {
+				fmt.Fprintf(os.Stderr, "[streaming] error: %v (retrying)\n", err)
+			}
+			continue
+		}
+		// closed gracefully without done: break
+		fmt.Println()
+		break
 	}
-	// if stream closed without explicit done, just newline for cleanliness
-	fmt.Println()
 }
 
 func modelsCmd(args []string) {
@@ -977,7 +1010,7 @@ func execCmd(args []string) {
 
 func hooksCmd(args []string) {
 	if len(args) == 0 || args[0] != "run" {
-		fmt.Println("usage: mycoder hooks run [--project <id>] [--targets fmt-check,test,lint] [--timeout 60] [--verbose]")
+		fmt.Println("usage: mycoder hooks run [--project <id>] [--targets fmt-check,test,lint] [--timeout 60] [--verbose] [--save <path.json>]")
 		os.Exit(1)
 	}
 	fs := flag.NewFlagSet("hooks run", flag.ExitOnError)
@@ -985,12 +1018,17 @@ func hooksCmd(args []string) {
 	targets := fs.String("targets", "", "comma-separated targets (fmt-check,test,lint)")
 	timeout := fs.Int("timeout", 60, "timeout in seconds per target")
 	verbose := fs.Bool("verbose", false, "print each target output")
+	save := fs.String("save", "", "save structured results JSON to project-relative path")
 	_ = fs.Parse(args[1:])
 	if *project == "" {
 		fmt.Println("--project required")
 		os.Exit(1)
 	}
-	body := fmt.Sprintf(`{"projectID":"%s","targets":[%s],"timeoutSec":%d}`, *project, toJSONStringArray(*targets), *timeout)
+	extra := ""
+	if strings.TrimSpace(*save) != "" {
+		extra = fmt.Sprintf(`,"artifactPath":%q`, *save)
+	}
+	body := fmt.Sprintf(`{"projectID":"%s","targets":[%s],"timeoutSec":%d%s}`, *project, toJSONStringArray(*targets), *timeout, extra)
 	resp, err := http.Post(serverURL()+"/tools/hooks", "application/json", strings.NewReader(body))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -1121,6 +1159,196 @@ func testCmd(args []string) {
 		}
 	}
 	if !v.Ok {
+		os.Exit(1)
+	}
+}
+
+// explainCmd asks the model to explain a path or symbol with citations.
+func explainCmd(args []string) {
+	fs := flag.NewFlagSet("explain", flag.ExitOnError)
+	project := fs.String("project", "", "project ID")
+	k := fs.Int("k", 7, "retrieval top K")
+	stream := fs.Bool("stream", false, "stream output")
+	_ = fs.Parse(args)
+	rest := fs.Args()
+	if *project == "" || len(rest) == 0 {
+		fmt.Println("usage: mycoder explain --project <id> [--k 7] [--stream] <path|symbol>")
+		os.Exit(1)
+	}
+	target := strings.Join(rest, " ")
+	// craft prompt: instruct explanation with citations
+	prompt := fmt.Sprintf("Explain '%s' in this repository. Summarize purpose, key functions, and important interactions. Cite files with line ranges.", target)
+	body := fmt.Sprintf(`{"messages":[{"role":"user","content":%q}],"stream":%v,"projectID":"%s","retrieval":{"k":%d}}`, prompt, *stream, *project, *k)
+	if *stream {
+		ctx, cancel := signalContext()
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, serverURL()+"/chat", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		rd := bufio.NewScanner(resp.Body)
+		lastEvent := ""
+		for rd.Scan() {
+			line := rd.Text()
+			if strings.HasPrefix(line, "event:") {
+				lastEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+				continue
+			}
+			if strings.HasPrefix(line, "data:") {
+				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				switch lastEvent {
+				case "token":
+					fmt.Print(data)
+				case "error":
+					if data != "" {
+						fmt.Fprintln(os.Stderr, data)
+					}
+				case "done":
+					fmt.Println()
+					return
+				default:
+					fmt.Print(data)
+				}
+			}
+		}
+		fmt.Println()
+		return
+	}
+	// non-streaming
+	resp, err := http.Post(serverURL()+"/chat", "application/json", strings.NewReader(body))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	var res struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		_, _ = io.Copy(os.Stdout, resp.Body)
+		return
+	}
+	fmt.Println(res.Content)
+}
+
+// editCmd requests an edit plan for the given goal and optional files.
+func editCmd(args []string) {
+	fs := flag.NewFlagSet("edit", flag.ExitOnError)
+	project := fs.String("project", "", "project ID")
+	goal := fs.String("goal", "", "edit goal/description")
+	files := fs.String("files", "", "comma-separated files to focus on")
+	k := fs.Int("k", 8, "retrieval top K")
+	stream := fs.Bool("stream", false, "stream output")
+	_ = fs.Parse(args)
+	if *project == "" || *goal == "" {
+		fmt.Println("usage: mycoder edit --project <id> --goal \"<설명>\" [--files a.go,b.go] [--k 8] [--stream]")
+		os.Exit(1)
+	}
+	var b strings.Builder
+	b.WriteString("You are a code-edit planner. Propose a minimal, safe patch plan for the goal, with citations.\n")
+	b.WriteString("Output a clear plan and suggested hunks as unified diff or patch-like blocks. Do not execute.")
+	if strings.TrimSpace(*files) != "" {
+		b.WriteString("\nFocus on files: ")
+		b.WriteString(*files)
+	}
+	b.WriteString("\nGoal: ")
+	b.WriteString(*goal)
+	prompt := b.String()
+	body := fmt.Sprintf(`{"messages":[{"role":"user","content":%q}],"stream":%v,"projectID":"%s","retrieval":{"k":%d}}`, prompt, *stream, *project, *k)
+	if *stream {
+		ctx, cancel := signalContext()
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, serverURL()+"/chat", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		rd := bufio.NewScanner(resp.Body)
+		lastEvent := ""
+		for rd.Scan() {
+			line := rd.Text()
+			if strings.HasPrefix(line, "event:") {
+				lastEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+				continue
+			}
+			if strings.HasPrefix(line, "data:") {
+				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				switch lastEvent {
+				case "token":
+					fmt.Print(data)
+				case "error":
+					if data != "" {
+						fmt.Fprintln(os.Stderr, data)
+					}
+				case "done":
+					fmt.Println()
+					return
+				default:
+					fmt.Print(data)
+				}
+			}
+		}
+		fmt.Println()
+		return
+	}
+	resp, err := http.Post(serverURL()+"/chat", "application/json", strings.NewReader(body))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	var res struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		_, _ = io.Copy(os.Stdout, resp.Body)
+		return
+	}
+	fmt.Println(res.Content)
+}
+
+// mcpCmd lists tools or calls a tool with JSON params
+func mcpCmd(args []string) {
+	if len(args) == 0 {
+		fmt.Println("usage: mycoder mcp tools|call --name <tool> --json '<params>'")
+		os.Exit(1)
+	}
+	sub := args[0]
+	switch sub {
+	case "tools":
+		resp, err := http.Get(serverURL() + "/mcp/tools")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		io.Copy(os.Stdout, resp.Body)
+	case "call":
+		fs := flag.NewFlagSet("mcp call", flag.ExitOnError)
+		name := fs.String("name", "", "tool name")
+		jsonParams := fs.String("json", "{}", "JSON params")
+		_ = fs.Parse(args[1:])
+		if *name == "" {
+			fmt.Println("--name required")
+			os.Exit(1)
+		}
+		body := fmt.Sprintf(`{"name":%q,"params":%s}`, *name, *jsonParams)
+		resp, err := http.Post(serverURL()+"/mcp/call", "application/json", strings.NewReader(body))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		io.Copy(os.Stdout, resp.Body)
+	default:
+		fmt.Println("usage: mycoder mcp tools|call --name <tool> --json '<params>'")
 		os.Exit(1)
 	}
 }

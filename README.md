@@ -11,10 +11,13 @@ mycoder는 로컬/사내 코드베이스를 색인하고 검색·질의(RAG)하�
 - 검색: `mycoder search "handler" --project <id>`
 - Q&A: `mycoder ask --project <id> "이 서버의 /metrics 구현 요약"`
 - 스트리밍 대화: `mycoder chat --project <id> "server.go 설명"`
+  - 옵션: `--retries N`(스트림 오류 시 자동 재시도), `--tty`(진행 상태를 stderr에 간단히 표시)
+- MCP 도구: `mycoder mcp tools` / `mycoder mcp call --name echo --json '{"text":"hi"}'`
 - 지식 추가/검증/승격: `mycoder knowledge ...` (아래 참고)
 - 메트릭: `mycoder metrics` (Prometheus 텍스트 포맷, `?format=json` 지원)
-- 훅 실행: `mycoder hooks run --project <id> [--targets fmt-check,test,lint] [--timeout 60] [--verbose]`
+- 훅 실행: `mycoder hooks run --project <id> [--targets fmt-check,test,lint] [--timeout 60] [--verbose] [--save path/to/hooks.json]`
   - 실패 시 요약(✅/❌)과 힌트(suggestion) 출력. 예) 포맷 실패 → `make fmt` 제안
+  - `--save`: 프로젝트 루트 상대 경로로 구조화 결과 JSON 아카이브(타겟별 ok/output/suggestion/소요/라인/바이트, reason)
 
 필수: Go 1.21+, (선택) LLM 서버(OpenAI 호환, LM Studio 등)
 
@@ -67,6 +70,8 @@ make hook-install
 - `MYCODER_OPENAI_BASE_URL`: OpenAI 호환 서버 URL
   - LM Studio 예: `http://localhost:1234/v1` 또는 사내 LLM 게이트웨이 URL
 - `MYCODER_OPENAI_API_KEY`: 인증 필요 시 API 키
+- `MYCODER_DISABLE_EMBEDDINGS`: `1`이면 임베딩/벡터 검색 비활성화(안전 폴백)
+- `MYCODER_CHAT_MAX_CHARS`: 대화 히스토리 슬라이딩 윈도우 문자 예산(기본 6000). 시스템 메시지는 항상 우선 포함.
 - 큐레이터(자동 재검증/정리) 관련
   - `MYCODER_CURATOR_DISABLE`: 비우면 활성, 값 설정 시 비활성
   - `MYCODER_CURATOR_INTERVAL`: 주기(`10m` 기본)
@@ -280,6 +285,8 @@ $ mycoder chat --project $PID "요약해줘: internal/server/server.go 변경 �
   MYCODER_FS_ALLOW_REGEX: ^(internal/|cmd/)
   MYCODER_CURATOR_INTERVAL: 10m
   MYCODER_KNOWLEDGE_MIN_TRUST: 0.4
+  MYCODER_KNOWLEDGE_DECAY_RATE: 0.01   # 주기마다 감소량(핀 제외)
+  MYCODER_KNOWLEDGE_DECAY_AFTER_DAYS: 30  # 마지막 검증/생성 이후 N일 경과 시 decay 적용
   ```
 
 ### 데이터베이스 마이그레이션/시드
@@ -291,3 +298,4 @@ $ mycoder chat --project $PID "요약해줘: internal/server/server.go 변경 �
 - `MYCODER_VECTOR_PROVIDER`: `noop`(기본) | `pgvector`
 - `MYCODER_PGVECTOR_DSN`: pgvector 연결 문자열 (예: `postgres://user:pass@host:5432/db?sslmode=disable`)
 - 현재 버전에서는 pgvector 어댑터가 스텁 상태이므로, 실제 KNN 검색은 추후 통합 예정입니다.
+ - 임베딩 폴백: 임베딩 모델이 없거나 실패 시 서버가 자동으로 임베딩 기능을 비활성화하고, 레키시컬 검색만 사용합니다. 강제 비활성화는 `MYCODER_DISABLE_EMBEDDINGS=1`로 설정하세요.

@@ -133,3 +133,24 @@
 ### POST /mcp/call
 - 요청: `{ tool:string, params:any }`
 - 응답: `{ result:any, logs?:string }`
+## MCP (Minimal)
+
+- GET `/mcp/tools`
+  - 응답: `{ "tools": [{"name":"echo","description":"...","params":["text"]}, ...] }`
+
+- POST `/mcp/call`
+  - 요청: `{ "name": "echo", "params": {"text": "hello"} }`
+  - 응답: `{ "ok": true, "result": "hello" }` 혹은 `{ "ok": false, "error": "unknown tool" }`
+
+## 에러 응답 형식(표준)
+
+- 공통 에러 포맷(JSON):
+  ```json
+  {
+    "error": "invalid_request",
+    "message": "projectID required",
+    "code": 400
+  }
+  ```
+- 적용 대상: 잘못된 메서드(405), 잘못된 JSON(400), 필수 필드 누락(400), 미존재 리소스(400/404), 내부 오류(500)
+- `/projects`, `/index/run`, `/index/run/stream` 등에서 표준 에러 포맷을 우선 적용했습니다. 나머지 엔드포인트도 순차 교체 예정입니다.

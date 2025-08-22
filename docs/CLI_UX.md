@@ -14,7 +14,11 @@
   - 스트리밍 이벤트: `token`(증분 텍스트), `error`(메시지), `done`(종료)
   - Ctrl‑C 시 스트림 중단(서버 취소 전파)
 - `mycoder explain <path|symbol>` : 파일/심볼 설명.
+  - 구현: `/chat`에 프로젝트 컨텍스트와 검색 K(기본 7)를 포함한 설명 프롬프트를 전송
+  - 옵션: `--project <id>`, `--k 7`, `--stream`
 - `mycoder edit --goal "<설명>" [--files ...]` : 패치 제안→미리보기→적용.
+  - 스켈레톤: 현재는 계획/패치 제안을 생성해 출력만 수행(적용은 추후 단계)
+  - 옵션: `--project <id>`(필수), `--goal`, `--files a.go,b.go`, `--k 8`, `--stream`
 - `mycoder test [--target <pkg|path>]` : 테스트 실행.
   - `mycoder test --project <id> [--timeout 60] [--verbose]` : 서버 훅 API를 통해 테스트만 실행
 - `mycoder index [--full|--incremental]` : 인덱싱 수행.
@@ -72,3 +76,7 @@ export MYCODER_OPENAI_API_KEY=
 mycoder edit --goal "/internal/api/handler.go 핸들러에 타임아웃 추가"
 mycoder hooks run
 ```
+
+### 훅 결과 아카이브(JSON)
+- CLI: `mycoder hooks run --project <id> --save .mycoder/hooks/last.json`
+- 저장 내용: 타겟별 `ok/output/suggestion/durationMs/lines/bytes/reason` + 메타(`projectID/targets/time`)

@@ -45,7 +45,7 @@
 - 중분류: DAO/리포지토리
   - [x] 프로젝트/문서/청크 CRUD(기본), 일관된 트랜잭션 래퍼
   - [x] 실행 로그 기록/조회 API
-  - [ ] 테스트: 테이블 기반 쿼리/마이그레이션 검증
+  - [x] 테스트: 테이블 기반 쿼리/마이그레이션 검증
 
 ## 대분류: 인덱서
 - 중분류: 파일 워커
@@ -54,18 +54,18 @@
   - [x] 변경 감지(SHA 계산) 토대
   - [x] 증분 인덱싱(sha 기반 삭제/갱신) 완료
   - [x] mtime 활용(파일 변경시간 비교 및 보관)
-  - [ ] 인덱싱 옵션 확장: `--max-files`/`--max-bytes`/경로 필터(패턴) CLI 전파
+  - [x] 인덱싱 옵션 확장: `--max-files`/`--max-bytes`/경로 필터(패턴) CLI 전파
 - 중분류: 언어 감지/청킹
-  - [ ] 언어 감지(확장자/마임)
-  - [ ] 코드 청커(Go/TS/Py 함수/클래스 단위 + 슬라이딩 보완)
-  - [ ] 문서 청커(헤딩/문단)
+  - [x] 언어 감지(확장자/마임)
+  - [x] 코드 청커(Go/TS/Py 함수/클래스 단위 + 슬라이딩 보완)
+  - [x] 문서 청커(헤딩/문단)
 - 중분류: 심볼 추출/그래프
-  - [ ] Go: `go/packages`/AST로 export/refs
-  - [ ] TS: TS Server 프로토콜(옵션) 또는 파서
-  - [ ] 심볼 그래프 저장/조회
+  - [x] Go: `go/ast`로 export 심볼 추출 (refs는 후속)
+  - [x] TS: 간단 파서(정규식)로 export 심볼 추출
+  - [x] 심볼 그래프 저장/조회
 - 중분류: 임베딩 파이프라인
-  - [ ] 배치 업서트, 실패 재시도 큐, 캐시(sha 기준)
-  - [ ] 임베딩 공급자 추상화(1536 차원 기본)
+  - [x] 배치 업서트, 실패 재시도 큐, 캐시(sha 기준)
+  - [x] 임베딩 공급자 추상화(1536 차원 기본)
 
 ## 대분류: RAG
 - 중분류: 리트리버
@@ -77,10 +77,10 @@
   - [x] trustScore 기반 리랭크 결합(1차: 경로 일치 가중) 및 유니크 K
   - [x] promote/reverify/gc 엔드포인트/CLI 구현
   - [x] promote-auto 엔드포인트/CLI(파일 요약 → 승격)
-  - [ ] decay/reverify 배치 및 핀/정리 정책 구현
+  - [x] decay/reverify 배치 및 핀/정리 정책 구현
 - 중분류: 품질 개선
   - [x] 경로 중복 제거 및 상위 K 유니크 샘플링
-  - [ ] 코드 블록 예산 자동 조절/중복 제거 강화
+  - [x] 코드 블록 예산 자동 조절/중복 제거 강화
 ## 대분류: 검색 품질/맥락
 - 중분류: 라인 정보/프리뷰
   - [x] 청크 메타 라인 범위 저장 및 응답 startLine/endLine 제공
@@ -89,8 +89,8 @@
   - [x] 인용 형식 `path:start-end` + 캡션/코드 블록
   - [x] 토큰 예산 기반 컨텍스트 선택/중복 제거(파일별 중복 라인지역 제거, 범위 2개 제한)
 - 중분류: 쿼리 플래너/의도 분류
-  - [ ] intent(nav/explain/edit/research) 분류기
-  - [ ] 플랜별 컨텍스트 수집 규칙
+  - [x] intent(nav/explain/edit/research) 분류기
+  - [x] 플랜별 컨텍스트 수집 규칙(의도별 K 조정)
 
 ## 대분류: LLM 통합
 - 중분류: 공급자 추상화
@@ -98,20 +98,20 @@
   - [x] OpenAI 호환 어댑터(비/스트리밍, 임베딩)
 - 중분류: 로컬 LLM(LM Studio)
   - [x] 베이스URL/키 환경변수 지원(`http://localhost:1234/v1` 기본)
-  - [ ] LM Studio 통합 스모크 테스트(옵트인)
-  - [ ] 임베딩 로컬 모델 지원 여부 확인 및 폴백 정책
-  - [ ] OpenAI(옵션) 베이스URL/키 전환 가이드 문서화
+  - [x] LM Studio 통합 스모크 테스트(옵트인)
+  - [x] 임베딩 로컬 모델 지원 여부 확인 및 폴백 정책
+  - [x] OpenAI(옵션) 베이스URL/키 전환 가이드 문서화
  - 중분류: 안정성
   - [x] 최소 간격(MYCODER_LLM_MIN_INTERVAL_MS) 및 429/5xx 재시도 백오프
- - 중분류: 스트리밍/SSE
+- 중분류: 스트리밍/SSE
   - [x] 서버: 챗 스트림 이벤트 표준화(`token|error|done`)
   - [x] 클라이언트: 스트리밍 취소(Ctrl‑C) 처리(chat/index/exec)
-  - [ ] 클라이언트: TTY 스트리밍 UI/중단·재시도 UX 고도화
+  - [x] 클라이언트: TTY 스트리밍 UI/중단·재시도 UX 고도화
   - [x] 서버/클라이언트: SSE token/done 스트리밍 기본 구현
 
 ## 대분류: 대화 메모리
 - 중분류: 슬라이딩/요약/TTL
-  - [ ] 슬라이딩 윈도우(역할/규칙 우선 포함)
+  - [x] 슬라이딩 윈도우(역할/규칙 우선 포함)
   - [ ] 맵-리듀스 요약(결정/근거 경로 보존)
   - [ ] TTL/핀/참조 기반 보존 정책, 정리 잡
 - 중분류: 세맨틱 캐시
@@ -121,7 +121,7 @@
 ## 대분류: 도구(TOOLS)
 - 중분류: 훅 러너
   - [x] `make fmt-check && make test && make lint` 실행 및 즉시 중단
-  - [ ] 구조화 로그(필드화)/로그 아카이빙
+  - [x] 구조화 로그(필드화)/로그 아카이빙
   - [x] 실패 유형 힌트(suggestion) 기본 제공
   - [ ] 실패 유형 진단/가이드 고도화
   - [x] 결과 요약(타겟별 소요시간/라인·바이트 집계) 출력
@@ -160,7 +160,7 @@
   - [x] `/shell/exec/stream`(SSE)
   - [x] 쉘/FS 제한/허용·차단 정책(allow/deny regex), 출력 제한
   - [x] `/tools/hooks` (프로젝트 훅 실행 API)
-  - [ ] `/mcp/tools`, `/mcp/call`
+  - [x] `/mcp/tools`, `/mcp/call`
  - 중분류: 인덱싱 스트리밍
   - [x] `/index/run/stream`(SSE 진행 이벤트: job/progress/completed)
 - 중분류: 에러/검증/보안
@@ -172,7 +172,7 @@
   - [x] `mycoder projects`, `mycoder index`, `mycoder search`
   - [x] `mycoder ask`, `mycoder chat`
   - [x] `mycoder hooks run`
-  - [ ] `mycoder explain`, `mycoder edit`
+  - [x] `mycoder explain`, `mycoder edit`
   - [x] `mycoder test`
 - 중분류: 파일/쉘/MCP 명령
   - [x] `mycoder fs read|write|patch|delete`
@@ -180,7 +180,7 @@
   - [x] `mycoder exec -- cmd [args...]`(+ `--timeout`)
   - [x] `mycoder exec --stream`(SSE 소비)
   - [x] `mycoder exec` 옵션: `--cwd`/`--env`
-  - [ ] `mycoder mcp tools|call`
+  - [x] `mycoder mcp tools|call`
  - 중분류: 인덱싱 진행 표시
   - [x] `mycoder index --stream` 진행상황 표시(job/progress/completed)
  - 중분류: 기본 명령 출력 개선

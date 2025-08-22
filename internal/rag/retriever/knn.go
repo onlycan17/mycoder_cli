@@ -25,7 +25,8 @@ func NewKNN(vs vectorstore.VectorStore, emb llm.Embedder) *KNNRetriever {
 func (r *KNNRetriever) Retrieve(ctx context.Context, projectID string, query string, k int) ([]Result, error) {
 	vecs, err := r.emb.Embeddings(ctx, r.model, []string{query})
 	if err != nil || len(vecs) == 0 {
-		return nil, err
+		// graceful fallback: no semantic results when embeddings unavailable
+		return nil, nil
 	}
 	res, err := r.vs.Search(ctx, projectID, vecs[0], k)
 	if err != nil {

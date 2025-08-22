@@ -67,6 +67,28 @@ type Knowledge struct {
 	Tags       string  `json:"tags,omitempty"`
 }
 
+// Symbol entity for code navigation and references.
+type Symbol struct {
+	ID        string `json:"id"`
+	ProjectID string `json:"projectID"`
+	Path      string `json:"path"`
+	Lang      string `json:"lang"`
+	Name      string `json:"name"`
+	Kind      string `json:"kind"`
+	StartLine int    `json:"startLine,omitempty"`
+	EndLine   int    `json:"endLine,omitempty"`
+	Signature string `json:"signature,omitempty"`
+}
+
+type SymbolEdge struct {
+	ID        string `json:"id"`
+	ProjectID string `json:"projectID"`
+	Path      string `json:"path"`
+	SrcName   string `json:"srcName"`
+	DstName   string `json:"dstName"`
+	Kind      string `json:"kind"` // ref|call|impl
+}
+
 // Run/ExecutionLog models for recording executions (shell/fs/hooks/mcp)
 type Run struct {
 	ID        string     `json:"id"`

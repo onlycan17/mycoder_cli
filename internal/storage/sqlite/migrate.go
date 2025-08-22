@@ -149,6 +149,18 @@ func (m Migrator) Up(ctx context.Context, db *sql.DB) error {
             FOREIGN KEY(project_id) REFERENCES projects(id)
         );`,
 		`CREATE INDEX IF NOT EXISTS idx_symbols_project_name ON symbols(project_id, name);`,
+		// symbol edges: references/calls/implements between symbols (by name for simplicity)
+		`CREATE TABLE IF NOT EXISTS symbol_edges (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            src_name TEXT NOT NULL,
+            dst_name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id)
+        );`,
+		`CREATE INDEX IF NOT EXISTS idx_symedges_project_path ON symbol_edges(project_id, path);`,
 	}
 	for i, s := range stmts {
 		if _, err := db.ExecContext(ctx, s); err != nil {

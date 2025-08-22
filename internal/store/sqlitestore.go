@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -297,8 +299,15 @@ func (s *SQLiteStore) UpsertDocument(projectID, path, content, sha, lang, mtime 
 		// insert new document
 		id := s.nextID("doc")
 		_, _ = tx.Exec(`INSERT INTO documents(id,project_id,path,sha,lang,mtime,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, id, projectID, path, sha, lang, mtime, now, now)
-		// index chunks
-		chunks := chunkTextWithLines(content, 2000)
+		// index chunks (prefer code-aware when lang known)
+		var chunks []chunk
+		if lang == "go" || lang == "ts" || lang == "js" || lang == "py" {
+			chunks = chunkSmartWithLines(content, lang, 2000)
+		} else if lang == "md" || lang == "txt" {
+			chunks = chunkDocWithLines(content, 2000)
+		} else {
+			chunks = chunkTextWithLines(content, 2000)
+		}
 		for i, ch := range chunks {
 			chkID := s.nextID("chk")
 			_, _ = tx.Exec(`INSERT INTO chunks(id,doc_id,ord,text,token_count,start_line,end_line,created_at) VALUES(?,?,?,?,?,?,?,?)`, chkID, id, i, ch.Text, nil, ch.StartLine, ch.EndLine, now)
@@ -317,7 +326,14 @@ func (s *SQLiteStore) UpsertDocument(projectID, path, content, sha, lang, mtime 
 	// reindex chunks: delete old entries then insert new
 	_, _ = tx.Exec(`DELETE FROM termindex WHERE doc_id=?`, existingID)
 	_, _ = tx.Exec(`DELETE FROM chunks WHERE doc_id=?`, existingID)
-	chunks := chunkTextWithLines(content, 2000)
+	var chunks []chunk
+	if lang == "go" || lang == "ts" || lang == "js" || lang == "py" {
+		chunks = chunkSmartWithLines(content, lang, 2000)
+	} else if lang == "md" || lang == "txt" {
+		chunks = chunkDocWithLines(content, 2000)
+	} else {
+		chunks = chunkTextWithLines(content, 2000)
+	}
 	for i, ch := range chunks {
 		chkID := s.nextID("chk")
 		_, _ = tx.Exec(`INSERT INTO chunks(id,doc_id,ord,text,token_count,start_line,end_line,created_at) VALUES(?,?,?,?,?,?,?,?)`, chkID, existingID, i, ch.Text, nil, ch.StartLine, ch.EndLine, now)
@@ -447,6 +463,67 @@ func (s *SQLiteStore) Search(projectID, query string, k int) []models.SearchResu
 	return out
 }
 
+// UpsertSymbols replaces symbols for a given project+path with the provided set.
+func (s *SQLiteStore) UpsertSymbols(projectID, path, lang string, symbols []models.Symbol) error {
+	return s.WithTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DELETE FROM symbols WHERE project_id=? AND path=?`, projectID, path); err != nil {
+			return err
+		}
+		for _, sym := range symbols {
+			_, err := tx.Exec(`INSERT INTO symbols(id,project_id,path,lang,name,kind,start_line,end_line,signature,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+				s.nextID("sym"), projectID, path, lang, sym.Name, sym.Kind, sym.StartLine, sym.EndLine, sym.Signature, time.Now().Format(time.RFC3339))
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// UpsertSymbolEdges replaces edges for a given project+path.
+func (s *SQLiteStore) UpsertSymbolEdges(projectID, path string, edges []models.SymbolEdge) error {
+	return s.WithTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DELETE FROM symbol_edges WHERE project_id=? AND path=?`, projectID, path); err != nil {
+			return err
+		}
+		for _, e := range edges {
+			if e.Kind == "" {
+				e.Kind = "ref"
+			}
+			_, err := tx.Exec(`INSERT INTO symbol_edges(id,project_id,path,src_name,dst_name,kind,created_at) VALUES(?,?,?,?,?,?,?)`,
+				s.nextID("sedge"), projectID, path, e.SrcName, e.DstName, e.Kind, time.Now().Format(time.RFC3339))
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// ListSymbolEdges lists edges for a project (optionally filtered by path).
+func (s *SQLiteStore) ListSymbolEdges(projectID, path string) ([]models.SymbolEdge, error) {
+	var rows *sql.Rows
+	var err error
+	if path != "" {
+		rows, err = s.db.Query(`SELECT id, path, src_name, dst_name, kind FROM symbol_edges WHERE project_id=? AND path=? ORDER BY id`, projectID, path)
+	} else {
+		rows, err = s.db.Query(`SELECT id, path, src_name, dst_name, kind FROM symbol_edges WHERE project_id=? ORDER BY path,id`, projectID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.SymbolEdge
+	for rows.Next() {
+		var e models.SymbolEdge
+		if err := rows.Scan(&e.ID, &e.Path, &e.SrcName, &e.DstName, &e.Kind); err == nil {
+			e.ProjectID = projectID
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
 // chunkText splits text into near-maxLen character chunks at newline boundaries when possible.
 func chunkText(s string, maxLen int) []string {
 	if maxLen <= 0 {
@@ -523,6 +600,109 @@ func chunkTextWithLines(s string, maxLen int) []chunk {
 		currentLine += lines - 1
 		start = cut
 	}
+	return out
+}
+
+// chunkSmartWithLines prefers code boundaries when possible based on language.
+func chunkSmartWithLines(s, lang string, maxLen int) []chunk {
+	if maxLen <= 0 {
+		maxLen = 2000
+	}
+	if len(s) == 0 {
+		return nil
+	}
+	re := boundaryRegex(lang)
+	lines := strings.Split(s, "\n")
+	var out []chunk
+	var buf strings.Builder
+	startLine := 1
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		// cut at boundary when current chunk is reasonably sized
+		if re != nil && re.MatchString(line) && buf.Len() >= maxLen/2 {
+			text := buf.String()
+			if text != "" {
+				out = append(out, chunk{Text: text, StartLine: startLine, EndLine: startLine + strings.Count(text, "\n")})
+				startLine += strings.Count(text, "\n")
+				buf.Reset()
+			}
+		}
+		if buf.Len()+len(line)+1 > maxLen && buf.Len() > 0 {
+			text := buf.String()
+			out = append(out, chunk{Text: text, StartLine: startLine, EndLine: startLine + strings.Count(text, "\n")})
+			startLine += strings.Count(text, "\n")
+			buf.Reset()
+		}
+		buf.WriteString(line)
+		buf.WriteByte('\n')
+	}
+	if buf.Len() > 0 {
+		text := buf.String()
+		out = append(out, chunk{Text: text, StartLine: startLine, EndLine: startLine + strings.Count(text, "\n")})
+	}
+	return out
+}
+
+func boundaryRegex(lang string) *regexp.Regexp {
+	switch lang {
+	case "go":
+		return regexp.MustCompile(`^(func|type|const|var)\b`)
+	case "ts", "js":
+		return regexp.MustCompile(`^(export\s+)?(async\s+)?(function|class)\b`)
+	case "py":
+		return regexp.MustCompile(`^(def|class)\b`)
+	default:
+		return nil
+	}
+}
+
+// chunkDocWithLines splits markdown/text into chunks by headings and paragraph
+// boundaries while respecting a soft maxLen. Headings always start a new chunk.
+func chunkDocWithLines(s string, maxLen int) []chunk {
+	if maxLen <= 0 {
+		maxLen = 2000
+	}
+	if len(s) == 0 {
+		return nil
+	}
+	lines := strings.Split(s, "\n")
+	var out []chunk
+	var buf strings.Builder
+	startLine := 1
+	flush := func() {
+		if buf.Len() == 0 {
+			return
+		}
+		text := buf.String()
+		out = append(out, chunk{Text: text, StartLine: startLine, EndLine: startLine + strings.Count(text, "\n")})
+		startLine += strings.Count(text, "\n")
+		buf.Reset()
+	}
+	isHeading := func(l string) bool {
+		ltrim := strings.TrimSpace(l)
+		if strings.HasPrefix(ltrim, "#") {
+			return true
+		}
+		return false
+	}
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		if isHeading(line) {
+			// start new chunk at heading
+			flush()
+		}
+		// if buffer too large, flush at paragraph boundary
+		if buf.Len()+len(line)+1 > maxLen && buf.Len() > 0 {
+			flush()
+		}
+		buf.WriteString(line)
+		buf.WriteByte('\n')
+		// optional paragraph break
+		if strings.TrimSpace(line) == "" && buf.Len() >= maxLen/2 {
+			flush()
+		}
+	}
+	flush()
 	return out
 }
 
@@ -614,6 +794,23 @@ func (s *SQLiteStore) ReverifyKnowledge(projectID string) (int, error) {
 
 func (s *SQLiteStore) GCKnowledge(projectID string, minScore float64) (int, error) {
 	res, err := s.db.Exec(`DELETE FROM knowledge WHERE project_id=? AND pinned=0 AND trust_score < ?`, projectID, minScore)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// DecayKnowledge reduces trust_score by rate for non-pinned items older than afterDays since last verify/create.
+func (s *SQLiteStore) DecayKnowledge(projectID string, rate float64, afterDays int) (int, error) {
+	if rate <= 0 {
+		return 0, nil
+	}
+	// SQLite: clamp at 0.0, only apply to non-pinned and older than afterDays
+	q := `UPDATE knowledge
+          SET trust_score = MAX(0.0, trust_score - ?)
+          WHERE project_id=? AND pinned=0 AND (julianday('now') - julianday(COALESCE(verified_at, created_at))) >= ?`
+	res, err := s.db.Exec(q, rate, projectID, afterDays)
 	if err != nil {
 		return 0, err
 	}

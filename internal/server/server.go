@@ -21,14 +21,28 @@ import (
 import (
 	"encoding/json"
 	"mycoder/internal/indexer"
+	"mycoder/internal/indexer/embedpipe"
 	"mycoder/internal/llm"
 	oai "mycoder/internal/llm/openai"
 	mylog "mycoder/internal/log"
 	"mycoder/internal/models"
+	"mycoder/internal/rag/planner"
 	"mycoder/internal/store"
+	"mycoder/internal/vectorstore"
 	"mycoder/internal/version"
 	"strconv"
 )
+
+// HooksResult is the structured summary per hook target.
+type HooksResult struct {
+	Ok         bool   `json:"ok"`
+	Output     string `json:"output"`
+	Suggestion string `json:"suggestion,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	DurationMs int    `json:"durationMs"`
+	Lines      int    `json:"lines"`
+	Bytes      int    `json:"bytes"`
+}
 
 type Store interface {
 	CreateProject(name, root string, ignore []string) *models.Project
@@ -60,9 +74,31 @@ type IncrementalStore interface {
 type API struct {
 	store Store
 	llm   llm.ChatProvider
+	emb   llm.Embedder
+	vs    vectorstore.VectorStore
 }
 
-func NewAPI(s Store, p llm.ChatProvider) *API { return &API{store: s, llm: p} }
+func NewAPI(s Store, p llm.ChatProvider) *API {
+	a := &API{store: s, llm: p}
+	if e, ok := any(p).(llm.Embedder); ok {
+		a.emb = e
+	}
+	a.vs = vectorstore.NewFromEnv()
+	// embedding availability check and env opt-out
+	if os.Getenv("MYCODER_DISABLE_EMBEDDINGS") == "1" {
+		a.emb = nil
+	} else if a.emb != nil {
+		// quick health check: tiny embedding with short timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		if _, err := a.emb.Embeddings(ctx, os.Getenv("MYCODER_EMBEDDING_MODEL"), []string{"ping"}); err != nil {
+			lg := mylog.New()
+			lg.Warn("embeddings.disabled", "reason", err.Error())
+			a.emb = nil
+		}
+	}
+	return a
+}
 
 // capBuffer captures writes up to a fixed limit and marks truncation beyond it.
 type capBuffer struct {
@@ -246,6 +282,9 @@ func (a *API) mux() *http.ServeMux {
 	mux.HandleFunc("/knowledge/promote/auto", a.handleKnowledgePromoteAuto)
 	// tools/hooks
 	mux.HandleFunc("/tools/hooks", a.handleToolsHooks)
+	// mcp tools
+	mux.HandleFunc("/mcp/tools", a.handleMCPTools)
+	mux.HandleFunc("/mcp/call", a.handleMCPCall)
 	return mux
 }
 
@@ -272,7 +311,7 @@ func Run(addr string) error {
 	}
 	api := NewAPI(st, prov)
 	mux := api.mux()
-	// optional background curator (reverify/decay)
+	// optional background curator (decay/reverify/gc)
 	if os.Getenv("MYCODER_CURATOR_DISABLE") == "" {
 		interval := 10 * time.Minute
 		if v := os.Getenv("MYCODER_CURATOR_INTERVAL"); v != "" {
@@ -286,11 +325,28 @@ func Run(addr string) error {
 				minTrust = f
 			}
 		}
+		decayRate := 0.01
+		if v := os.Getenv("MYCODER_KNOWLEDGE_DECAY_RATE"); v != "" {
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				decayRate = f
+			}
+		}
+		decayAfterDays := 30
+		if v := os.Getenv("MYCODER_KNOWLEDGE_DECAY_AFTER_DAYS"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				decayAfterDays = n
+			}
+		}
 		go func() {
 			t := time.NewTicker(interval)
 			defer t.Stop()
 			for range t.C {
 				for _, p := range st.ListProjects() {
+					if decayRate > 0 {
+						if ss, ok := st.(*store.SQLiteStore); ok {
+							_, _ = ss.DecayKnowledge(p.ID, decayRate, decayAfterDays)
+						}
+					}
 					_, _ = st.ReverifyKnowledge(p.ID)
 					_, _ = st.GCKnowledge(p.ID, minTrust)
 				}
@@ -388,23 +444,23 @@ func (a *API) handleProjects(w http.ResponseWriter, r *http.Request) {
 			Ignore   []string `json:"ignore"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid json", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
 			return
 		}
 		if req.Name == "" || req.RootPath == "" {
-			http.Error(w, "name and rootPath required", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "invalid_request", "name and rootPath required")
 			return
 		}
 		p := a.store.CreateProject(req.Name, req.RootPath, req.Ignore)
 		writeJSON(w, http.StatusOK, map[string]string{"projectID": p.ID})
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 	}
 }
 
 func (a *API) handleIndexRun(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 		return
 	}
 	var req struct {
@@ -416,11 +472,11 @@ func (a *API) handleIndexRun(w http.ResponseWriter, r *http.Request) {
 		Exclude   []string         `json:"exclude"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
 		return
 	}
 	if req.ProjectID == "" {
-		http.Error(w, "projectID required", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID required")
 		return
 	}
 	if req.Mode == "" {
@@ -428,7 +484,7 @@ func (a *API) handleIndexRun(w http.ResponseWriter, r *http.Request) {
 	}
 	job, err := a.store.CreateIndexJob(req.ProjectID, req.Mode)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	// 비동기 처리(즉시 완료 스텁 구현)
@@ -487,8 +543,12 @@ func (a *API) handleIndexRunStream(w http.ResponseWriter, r *http.Request) {
 		Include   []string         `json:"include"`
 		Exclude   []string         `json:"exclude"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+		return
+	}
+	if req.ProjectID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID required")
 		return
 	}
 	if req.Mode == "" {
@@ -496,7 +556,7 @@ func (a *API) handleIndexRunStream(w http.ResponseWriter, r *http.Request) {
 	}
 	p, ok := a.store.GetProject(req.ProjectID)
 	if !ok {
-		http.Error(w, "project not found", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_request", "project not found")
 		return
 	}
 	job, err := a.store.CreateIndexJob(req.ProjectID, req.Mode)
@@ -546,13 +606,20 @@ func (a *API) handleIndexRunStream(w http.ResponseWriter, r *http.Request) {
 	// ingestion phase with progress, respect client cancel
 	reqCtx := r.Context()
 	ingested := 0
+	var pipe *embedpipe.Pipeline
+	if a.emb != nil && a.vs != nil {
+		pipe = embedpipe.New(a.emb, a.vs)
+	}
 	if inc, ok := a.store.(IncrementalStore); ok {
 		present := make([]string, 0, total)
 		for _, d := range docs {
 			if reqCtx.Err() != nil {
 				return
 			}
-			inc.UpsertDocument(p.ID, d.Path, d.Content, d.SHA, d.Lang, d.MTime)
+			doc := inc.UpsertDocument(p.ID, d.Path, d.Content, d.SHA, d.Lang, d.MTime)
+			if pipe != nil {
+				pipe.Add(p.ID, doc.ID, d.Path, d.SHA, d.Content)
+			}
 			present = append(present, d.Path)
 			ingested++
 			if ingested%10 == 0 || ingested == total {
@@ -560,12 +627,20 @@ func (a *API) handleIndexRunStream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		_ = inc.PruneDocuments(p.ID, present)
+		if pipe != nil {
+			_ = pipe.Flush(reqCtx)
+		}
 	} else {
 		for _, d := range docs {
 			if reqCtx.Err() != nil {
 				return
 			}
 			a.store.AddDocument(p.ID, d.Path, d.Content)
+			// best-effort embeddings on full-doc content if possible
+			if pipe != nil {
+				pipe.Add(p.ID, "", d.Path, d.SHA, d.Content)
+				_ = pipe.Flush(reqCtx)
+			}
 			ingested++
 			if ingested%10 == 0 || ingested == total {
 				send("progress", fmt.Sprintf(`{"indexed":%d,"total":%d}`, ingested, total))
@@ -601,6 +676,16 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+type apiError struct {
+	Error   string `json:"error"`
+	Message string `json:"message"`
+	Code    int    `json:"code"`
+}
+
+func writeError(w http.ResponseWriter, status int, errStr, message string) {
+	writeJSON(w, status, apiError{Error: errStr, Message: message, Code: status})
 }
 
 func (a *API) handleSearch(w http.ResponseWriter, r *http.Request) {
@@ -737,8 +822,12 @@ func (a *API) handleKnowledgeVet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct{ ProjectID string }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+		return
+	}
+	if req.ProjectID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID required")
 		return
 	}
 	n, err := a.store.VetKnowledge(req.ProjectID)
@@ -832,7 +921,7 @@ func (a *API) handleKnowledgePromoteAuto(w http.ResponseWriter, r *http.Request)
 	// read snippets from files (cap budget)
 	p, ok := a.store.GetProject(req.ProjectID)
 	if !ok {
-		http.Error(w, "project not found", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_request", "project not found")
 		return
 	}
 	var b strings.Builder
@@ -914,6 +1003,7 @@ func (a *API) handleToolsHooks(w http.ResponseWriter, r *http.Request) {
 		Targets    []string          `json:"targets"`
 		TimeoutSec int               `json:"timeoutSec"`
 		Env        map[string]string `json:"env"`
+		Artifact   string            `json:"artifactPath"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" {
 		http.Error(w, "invalid json", http.StatusBadRequest)
@@ -928,15 +1018,7 @@ func (a *API) handleToolsHooks(w http.ResponseWriter, r *http.Request) {
 	if len(targets) == 0 {
 		targets = []string{"fmt-check", "test", "lint"}
 	}
-	type result struct {
-		Ok         bool   `json:"ok"`
-		Output     string `json:"output"`
-		Suggestion string `json:"suggestion,omitempty"`
-		DurationMs int    `json:"durationMs"`
-		Lines      int    `json:"lines"`
-		Bytes      int    `json:"bytes"`
-	}
-	out := map[string]result{}
+	out := map[string]HooksResult{}
 	timeout := 60 * time.Second
 	if req.TimeoutSec > 0 {
 		timeout = time.Duration(req.TimeoutSec) * time.Second
@@ -961,10 +1043,11 @@ func (a *API) handleToolsHooks(w http.ResponseWriter, r *http.Request) {
 		cancel()
 		ok := err == nil
 		rstr := string(b)
-		out[t] = result{
+		out[t] = HooksResult{
 			Ok:         ok,
 			Output:     rstr,
 			Suggestion: hintFromOutput(t, rstr),
+			Reason:     detectHookReason(t, rstr, ok),
 			DurationMs: int(dur.Milliseconds()),
 			Lines:      countLines(rstr),
 			Bytes:      len(b),
@@ -974,7 +1057,79 @@ func (a *API) handleToolsHooks(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	// optionally save artifact JSON to project-relative path
+	if strings.TrimSpace(req.Artifact) != "" {
+		saveHooksArtifact(p.RootPath, req.ProjectID, req.Targets, out, req.Artifact)
+	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// Minimal MCP-like tools registry (safe, demo-level)
+type mcpTool struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Params      []string `json:"params"`
+}
+
+func (a *API) handleMCPTools(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	tools := []mcpTool{
+		{Name: "echo", Description: "Echo back the provided text", Params: []string{"text"}},
+		{Name: "time", Description: "Return server time RFC3339", Params: []string{}},
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tools": tools})
+}
+
+func (a *API) handleMCPCall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name   string            `json:"name"`
+		Params map[string]string `json:"params"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	switch req.Name {
+	case "echo":
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": req.Params["text"]})
+	case "time":
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": time.Now().Format(time.RFC3339)})
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "unknown tool"})
+	}
+}
+
+// saveHooksArtifact writes structured hooks results JSON to a project-relative path, ensuring confinement.
+func saveHooksArtifact(root, projectID string, targets []string, results map[string]HooksResult, rel string) {
+	if root == "" || rel == "" {
+		return
+	}
+	// sanitize and ensure path stays within root
+	abs := filepath.Join(root, rel)
+	if relp, err := filepath.Rel(root, abs); err != nil || strings.HasPrefix(relp, "..") {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(abs), 0o755)
+	// wrap with metadata
+	payload := map[string]any{
+		"projectID": projectID,
+		"targets":   targets,
+		"time":      time.Now().Format(time.RFC3339),
+		"results":   results,
+	}
+	f, err := os.Create(abs)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_ = json.NewEncoder(f).Encode(payload)
 }
 
 func hintFromOutput(target, output string) string {
@@ -1011,6 +1166,33 @@ func hintFromOutput(target, output string) string {
 	}
 	if strings.Contains(lo, "timeout") || strings.Contains(lo, "signal: killed") {
 		return "타임아웃이 발생했습니다. --timeout 값을 늘려보세요."
+	}
+	return ""
+}
+
+// detectHookReason attempts to classify why a hook failed (or warn), to help UIs route users.
+func detectHookReason(target, output string, ok bool) string {
+	if ok {
+		return ""
+	}
+	lo := strings.ToLower(output)
+	switch target {
+	case "fmt-check":
+		if strings.Contains(lo, "files need formatting") {
+			return "fmt-mismatch"
+		}
+	case "test":
+		if strings.Contains(output, "--- FAIL") || strings.Contains(output, "FAIL\t") || strings.Contains(lo, "exit status 1") {
+			return "test-fail"
+		}
+	case "lint":
+		if strings.Contains(lo, "vet:") || strings.Contains(lo, "declared and not used") || strings.Contains(lo, "invalid") {
+			return "vet-issue"
+		}
+	}
+	// generic
+	if strings.Contains(lo, "error") || strings.Contains(lo, "fail") {
+		return "generic-failure"
 	}
 	return ""
 }
@@ -1464,6 +1646,8 @@ func (a *API) handleChat(w http.ResponseWriter, r *http.Request) {
 	metrics.chatRequests++
 	metrics.mu.Unlock()
 
+	// apply sliding window after RAG context; keep system rules first
+	msgs = slidingWindow(msgs)
 	st, err := a.llm.Chat(r.Context(), req.Model, msgs, req.Stream, req.Temperature)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -1530,6 +1714,57 @@ func jsonEscape(s string) string {
 	return string(b)
 }
 
+// slidingWindow trims conversation messages to fit a simple character budget,
+// keeping system messages first and the most recent user/assistant messages.
+func slidingWindow(messages []llm.Message) []llm.Message {
+	// budget from env (chars), default ~6000 bytes
+	max := 6000
+	if v := os.Getenv("MYCODER_CHAT_MAX_CHARS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			max = n
+		}
+	}
+	if len(messages) == 0 || max <= 0 {
+		return messages
+	}
+	var systems []llm.Message
+	var rest []llm.Message
+	for _, m := range messages {
+		if m.Role == llm.RoleSystem {
+			systems = append(systems, m)
+		} else {
+			rest = append(rest, m)
+		}
+	}
+	// collect from tail of rest until budget allows
+	budget := max
+	// account system messages first
+	for _, m := range systems {
+		budget -= len(m.Content)
+	}
+	if budget <= 0 {
+		return systems
+	}
+	picked := make([]llm.Message, 0, len(rest))
+	total := 0
+	for i := len(rest) - 1; i >= 0; i-- {
+		c := len(rest[i].Content)
+		if total+c > budget {
+			break
+		}
+		picked = append(picked, rest[i])
+		total += c
+	}
+	// reverse picked to chronological order
+	for i, j := 0, len(picked)-1; i < j; i, j = i+1, j-1 {
+		picked[i], picked[j] = picked[j], picked[i]
+	}
+	out := make([]llm.Message, 0, len(systems)+len(picked))
+	out = append(out, systems...)
+	out = append(out, picked...)
+	return out
+}
+
 // withRAGContext builds a simple context message using lexical search results for the latest user query.
 func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []llm.Message {
 	var q string
@@ -1542,6 +1777,9 @@ func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []
 	if strings.TrimSpace(q) == "" {
 		return messages
 	}
+	// adjust retrieval K based on intent
+	intent := planner.Classify(q)
+	k = planner.RetrievalK(intent, k)
 	raw := a.store.Search(projectID, q, k*2)
 	if len(raw) == 0 {
 		return messages
@@ -1640,8 +1878,9 @@ func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []
 	var b strings.Builder
 	b.WriteString("You are a coding assistant. Use the following repo context and cite files with line ranges. If not enough evidence, say you are unsure.\n\n")
 	b.WriteString("Context:\n")
-	// approximate token budget in bytes
+	// approximate token budget in bytes (dynamic line count per snippet)
 	budget := 3000
+	avgLineBytes := 80 // heuristic; used to size maxLines per snippet
 	var root string
 	if p, ok := a.store.GetProject(projectID); ok {
 		root = p.RootPath
@@ -1659,9 +1898,36 @@ func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []
 		b.WriteString(loc)
 		b.WriteString("\n")
 		if root != "" {
-			code := readSnippet(root, h.Path, h.StartLine, h.EndLine, 24)
+			// dynamic maxLines based on remaining budget
+			maxLines := 24
+			if avgLineBytes > 0 {
+				est := budget / avgLineBytes
+				if est < maxLines {
+					maxLines = est
+				}
+				if maxLines < 6 {
+					maxLines = 6
+				}
+			}
+			code := readSnippet(root, h.Path, h.StartLine, h.EndLine, maxLines)
 			if code != "" {
 				block := fmt.Sprintf("```%s\n%s\n```\n", fenceLangFor(h.Path), code)
+				if len(block) > budget {
+					// trim block content to fit remaining budget, keep fences
+					// leave ~8 bytes headroom
+					lang := fenceLangFor(h.Path)
+					head := 4 + len(lang) // ``` + lang + \n
+					tail := 4             // ```\n
+					keep := budget - head - tail
+					if keep > 0 {
+						// extract content portion
+						content := code
+						if len(content) > keep {
+							content = content[:keep]
+						}
+						block = fmt.Sprintf("```%s\n%s\n```\n", lang, content)
+					}
+				}
 				if budget-len(block) > 0 {
 					b.WriteString(block)
 					budget -= len(block)
