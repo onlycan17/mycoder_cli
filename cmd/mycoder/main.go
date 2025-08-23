@@ -76,6 +76,7 @@ func main() {
 		mcpCmd(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
+
 	default:
 		// basic placeholders for planned commands
 		cmd := os.Args[1]
@@ -102,6 +103,9 @@ func usage() {
 	fmt.Println("  mycoder metrics")
 	fmt.Println("  mycoder knowledge [add|list|vet|promote|reverify|gc]")
 	fmt.Println("  mycoder fs [read|write|delete|patch] --project <id> --path <p> [--content ...] [--start N --length N --replace ...]")
+	fmt.Println("  mycoder fs diff --project <id> --path <p> --new-file <file> [--context 3] [--ignore-crlf] [--color]")
+	fmt.Println("  mycoder fs patch-unified --project <id> --file <diff.patch> [--dry-run|--yes] [--color]")
+	fmt.Println("  mycoder fs patch-unified-rollback --project <id> --patch-id <id> [--dry-run|--yes]")
 	fmt.Println("  mycoder exec -- -- <cmd> [args...]")
 	fmt.Println("  mycoder explain --project <id> <path|symbol>")
 	fmt.Println("  mycoder edit --project <id> --goal \"<설명>\" [--files a.go,b.go] [--stream]")
@@ -169,6 +173,8 @@ func indexCmd(args []string) {
 	project := fs.String("project", "", "project ID")
 	mode := fs.String("mode", "full", "full|incremental")
 	stream := fs.Bool("stream", false, "stream progress (SSE)")
+	retries := fs.Int("retries", 0, "auto-retry times on stream error")
+	save := fs.String("save-log", "", "save stream lines to file")
 	maxFiles := fs.Int("max-files", 0, "max files to index")
 	maxBytes := fs.Int("max-bytes", 0, "max file size bytes")
 	include := fs.String("include", "", "comma-separated glob patterns to include")
@@ -181,51 +187,58 @@ func indexCmd(args []string) {
 	body := fmt.Sprintf(`{"projectID":"%s","mode":"%s","maxFiles":%d,"maxBytes":%d,"include":[%s],"exclude":[%s]}`,
 		*project, *mode, *maxFiles, *maxBytes, toJSONStringArray(*include), toJSONStringArray(*exclude))
 	if *stream {
-		ctx, cancel := signalContext()
-		defer cancel()
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, serverURL()+"/index/run/stream", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		defer resp.Body.Close()
-		rd := bufio.NewScanner(resp.Body)
-		lastEvent := ""
-		total, indexed := 0, 0
-		var jobID string
-		for rd.Scan() {
-			line := rd.Text()
-			if strings.HasPrefix(line, "event:") {
-				lastEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		attempts := *retries + 1
+		for i := 0; i < attempts; i++ {
+			ctx, cancel := signalContext()
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, serverURL()+"/index/run/stream", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				cancel()
+				if i == attempts-1 {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
 				continue
 			}
-			if strings.HasPrefix(line, "data:") {
-				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-				switch lastEvent {
-				case "job":
-					jobID = data
-					fmt.Printf("job: %s\n", jobID)
-				case "progress":
-					// parse {indexed,total}
-					var p struct {
-						Indexed int `json:"indexed"`
-						Total   int `json:"total"`
+			rd := bufio.NewScanner(resp.Body)
+			lastEvent := ""
+			total, indexed := 0, 0
+			var jobID string
+			for rd.Scan() {
+				line := rd.Text()
+				if strings.HasPrefix(line, "event:") {
+					lastEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+					continue
+				}
+				if strings.HasPrefix(line, "data:") {
+					data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+					if *save != "" {
+						_ = appendLog(*save, fmt.Sprintf("%s %s\n", lastEvent, data))
 					}
-					_ = json.Unmarshal([]byte(data), &p)
-					total = p.Total
-					indexed = p.Indexed
-					// simple progress line
-					fmt.Printf("progress: %d/%d\n", indexed, total)
-				case "completed":
-					fmt.Println("completed")
-				case "error":
-					fmt.Fprintln(os.Stderr, data)
-				default:
-					// ignore
+					switch lastEvent {
+					case "job":
+						jobID = data
+						fmt.Printf("job: %s\n", jobID)
+					case "progress":
+						var p struct{ Indexed, Total int }
+						_ = json.Unmarshal([]byte(data), &p)
+						total, indexed = p.Total, p.Indexed
+						fmt.Printf("progress: %d/%d\n", indexed, total)
+					case "completed":
+						fmt.Println("completed")
+					case "error":
+						fmt.Fprintln(os.Stderr, data)
+					}
 				}
 			}
+			resp.Body.Close()
+			cancel()
+			if err := rd.Err(); err != nil && i < attempts-1 {
+				fmt.Fprintf(os.Stderr, "[streaming] error: %v (retrying)\n", err)
+				continue
+			}
+			break
 		}
 		return
 	}
@@ -323,6 +336,7 @@ func chatCmd(args []string) {
 	k := fs.Int("k", 5, "retrieval top K")
 	retries := fs.Int("retries", 0, "auto-retry times on stream error")
 	tty := fs.Bool("tty", false, "print lightweight stream status to stderr")
+	save := fs.String("save-log", "", "save stream lines to file")
 	_ = fs.Parse(args)
 	rest := fs.Args()
 	if len(rest) == 0 {
@@ -362,6 +376,9 @@ func chatCmd(args []string) {
 			}
 			if strings.HasPrefix(line, "data:") {
 				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				if *save != "" {
+					_ = appendLog(*save, fmt.Sprintf("%s %s\n", lastEvent, data))
+				}
 				switch lastEvent {
 				case "token":
 					fmt.Print(data)
@@ -395,6 +412,16 @@ func chatCmd(args []string) {
 	}
 }
 
+// appendLog appends a line to a file, creating it if needed.
+func appendLog(path, s string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(s)
+	return err
+}
 func modelsCmd(args []string) {
 	fs := flag.NewFlagSet("models", flag.ExitOnError)
 	format := fs.String("format", "table", "output format: table|json|raw")
@@ -676,6 +703,35 @@ func knowledgeCmd(args []string) {
 			os.Exit(1)
 		}
 		defer resp.Body.Close()
+
+	case "approve":
+		fs := flag.NewFlagSet("knowledge approve", flag.ExitOnError)
+		project := fs.String("project", "", "project ID")
+		ids := fs.String("ids", "", "comma-separated knowledge IDs")
+		min := fs.Float64("min", 0.8, "min trust score after approve")
+		pin := fs.Bool("pin", true, "pin items on approve")
+		_ = fs.Parse(args[1:])
+		if *project == "" || *ids == "" {
+			fmt.Println("--project and --ids required")
+			os.Exit(1)
+		}
+		var b strings.Builder
+		b.WriteString(`{"ProjectID":"` + *project + `","IDs":[`)
+		parts := strings.Split(*ids, ",")
+		for i, id := range parts {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString(fmt.Sprintf("%q", strings.TrimSpace(id)))
+		}
+		b.WriteString(fmt.Sprintf(`],"Pin":%v,"MinTrust":%f}`, *pin, *min))
+		resp, err := http.Post(serverURL()+"/knowledge/approve", "application/json", strings.NewReader(b.String()))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		io.Copy(os.Stdout, resp.Body)
 		io.Copy(os.Stdout, resp.Body)
 	default:
 		fmt.Println("usage: mycoder knowledge [add|list|vet] ...")
@@ -729,7 +785,10 @@ func tailBytes(s string, max int) string {
 	return s[len(s)-max:]
 }
 
-func colorCyan(s string) string { return "\x1b[36m" + s + "\x1b[0m" }
+func colorRed(s string) string    { return "\x1b[31m" + s + "\x1b[0m" }
+func colorGreen(s string) string  { return "\x1b[32m" + s + "\x1b[0m" }
+func colorYellow(s string) string { return "\x1b[33m" + s + "\x1b[0m" }
+func colorCyan(s string) string   { return "\x1b[36m" + s + "\x1b[0m" }
 
 func signalContext() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -864,6 +923,144 @@ func fsCmd(args []string) {
 		}
 		defer resp.Body.Close()
 		io.Copy(os.Stdout, resp.Body)
+	case "patch-unified":
+		fs := flag.NewFlagSet("fs patch-unified", flag.ExitOnError)
+		project := fs.String("project", "", "project ID")
+		file := fs.String("file", "", "unified diff file path")
+		dryRun := fs.Bool("dry-run", false, "dry run (preview only)")
+		yes := fs.Bool("yes", false, "apply without prompt (required unless --dry-run)")
+		ignoreWS := fs.Bool("ignore-ws", false, "ignore whitespace when applying (fuzzy)")
+		color := fs.Bool("color", false, "colorize diff summary")
+		_ = fs.Parse(args[1:])
+		if *project == "" || *file == "" {
+			fmt.Println("--project and --file required")
+			os.Exit(1)
+		}
+		b, err := os.ReadFile(*file)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		body := fmt.Sprintf(`{"projectID":"%s","diffText":%q,"dryRun":%v,"yes":%v}`, *project, string(b), *dryRun, *yes)
+		url := serverURL() + "/fs/patch/unified"
+		if *ignoreWS {
+			url += "?ignorews=1"
+		}
+		resp, err := http.Post(url, "application/json", strings.NewReader(body))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		var res struct {
+			Ok           bool   `json:"ok"`
+			DryRun       bool   `json:"dryRun"`
+			PatchID      string `json:"patchID"`
+			TotalAdd     int    `json:"totalAdd"`
+			TotalDel     int    `json:"totalDel"`
+			WrittenBytes int    `json:"writtenBytes"`
+			Files        []struct {
+				Path                   string
+				Add, Del, WrittenBytes int
+				Conflict               string
+			}
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+			_, _ = io.Copy(os.Stdout, resp.Body)
+			return
+		}
+		if *color {
+			fmt.Printf("%s +%d %s -%d\n", colorGreen("added"), res.TotalAdd, colorRed("deleted"), res.TotalDel)
+		} else {
+			fmt.Printf("added +%d deleted -%d\n", res.TotalAdd, res.TotalDel)
+		}
+		for _, f := range res.Files {
+			name := f.Path
+			if *color {
+				if f.Conflict != "" {
+					name = colorRed(name)
+				} else if f.WrittenBytes > 0 {
+					name = colorGreen(name)
+				} else {
+					name = colorCyan(name)
+				}
+			}
+			fmt.Printf("  %s (+%d/-%d)", name, f.Add, f.Del)
+			if f.WrittenBytes > 0 {
+				fmt.Printf(" [%dB]", f.WrittenBytes)
+			}
+			if f.Conflict != "" {
+				fmt.Printf(" conflict: %s", f.Conflict)
+			}
+			fmt.Println()
+		}
+		if res.PatchID != "" {
+			fmt.Printf("patchID: %s\n", res.PatchID)
+		}
+		if !res.Ok {
+			os.Exit(1)
+		}
+		if res.DryRun && *color {
+			fmt.Println("\nPreview:")
+			// colorize full diff content
+			fmt.Print(colorizeUnifiedDiff(string(b)))
+		}
+	case "patch-unified-rollback":
+		fs := flag.NewFlagSet("fs patch-unified-rollback", flag.ExitOnError)
+		project := fs.String("project", "", "project ID")
+		patchID := fs.String("patch-id", "", "patch ID returned from apply")
+		dryRun := fs.Bool("dry-run", false, "dry run (preview only)")
+		yes := fs.Bool("yes", false, "confirm rollback")
+		_ = fs.Parse(args[1:])
+		if *project == "" || *patchID == "" {
+			fmt.Println("--project and --patch-id required")
+			os.Exit(1)
+		}
+		body := fmt.Sprintf(`{"projectID":"%s","patchID":"%s","dryRun":%v,"yes":%v}`, *project, *patchID, *dryRun, *yes)
+		resp, err := http.Post(serverURL()+"/fs/patch/unified/rollback", "application/json", strings.NewReader(body))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		io.Copy(os.Stdout, resp.Body)
+	case "diff":
+		fs := flag.NewFlagSet("fs diff", flag.ExitOnError)
+		project := fs.String("project", "", "project ID")
+		path := fs.String("path", "", "path")
+		newFile := fs.String("new-file", "", "path to new content file")
+		context := fs.Int("context", 3, "context lines")
+		ignoreCRLF := fs.Bool("ignore-crlf", false, "ignore CRLF differences")
+		color := fs.Bool("color", false, "colorize diff")
+		_ = fs.Parse(args[1:])
+		if *project == "" || *path == "" || *newFile == "" {
+			fmt.Println("--project, --path and --new-file required")
+			os.Exit(1)
+		}
+		b, err := os.ReadFile(*newFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		body := fmt.Sprintf(`{"projectID":"%s","path":"%s","newContent":%q,"context":%d,"ignoreCRLF":%v}`, *project, *path, string(b), *context, *ignoreCRLF)
+		resp, err := http.Post(serverURL()+"/fs/diff", "application/json", strings.NewReader(body))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		var res struct {
+			Diff string `json:"diffText"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+			_, _ = io.Copy(os.Stdout, resp.Body)
+			return
+		}
+		if *color {
+			fmt.Print(colorizeUnifiedDiff(res.Diff))
+		} else {
+			fmt.Print(res.Diff)
+		}
 	default:
 		fmt.Println("usage: mycoder fs [read|write|delete|patch] --project <id> --path <p> [--content ...] [--start N --length N --replace ...]")
 		os.Exit(1)
@@ -880,6 +1077,8 @@ func execCmd(args []string) {
 	tail := fs.Int("tail", 0, "print only the last N lines (non-stream)")
 	maxBytes := fs.Int("max-bytes", 0, "limit printed bytes to N (non-stream)")
 	streamTail := fs.Int("stream-tail", 0, "buffer and print only last N lines at end (stream)")
+	retries := fs.Int("retries", 0, "auto-retry times on stream error")
+	save := fs.String("save-log", "", "save stream lines to file")
 	_ = fs.Parse(args)
 	rest := fs.Args()
 	if *project == "" || len(rest) == 0 {
@@ -902,80 +1101,91 @@ func execCmd(args []string) {
 	}{ProjectID: *project, Cmd: cmd, Args: argv, Timeout: *timeout, Cwd: *cwd, Env: parseEnvCSV(*envCSV)}
 	b, _ := json.Marshal(body)
 	if *stream {
-		ctx2, cancel2 := signalContext()
-		defer cancel2()
-		req, _ := http.NewRequestWithContext(ctx2, http.MethodPost, serverURL()+"/shell/exec/stream", strings.NewReader(string(b)))
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		defer resp.Body.Close()
-		rd := bufio.NewScanner(resp.Body)
-		lastEvent := ""
-		exitCode := 0
-		limited := false
-		// optional tail buffers
-		var bufOut, bufErr []string
-		push := func(buf *[]string, line string, max int) {
-			if max <= 0 {
-				return
-			}
-			*buf = append(*buf, line)
-			if len(*buf) > max {
-				*buf = (*buf)[len(*buf)-max:]
-			}
-		}
-		for rd.Scan() {
-			line := rd.Text()
-			if strings.HasPrefix(line, "event:") {
-				lastEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		attempts := *retries + 1
+		for i := 0; i < attempts; i++ {
+			ctx2, cancel2 := signalContext()
+			req, _ := http.NewRequestWithContext(ctx2, http.MethodPost, serverURL()+"/shell/exec/stream", strings.NewReader(string(b)))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				cancel2()
+				if i == attempts-1 {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
 				continue
 			}
-			if strings.HasPrefix(line, "data:") {
-				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-				switch lastEvent {
-				case "stdout":
-					if *streamTail > 0 {
-						push(&bufOut, data, *streamTail)
-					} else {
-						fmt.Println(data)
+			rd := bufio.NewScanner(resp.Body)
+			lastEvent := ""
+			exitCode := 0
+			limited := false
+			var bufOut, bufErr []string
+			push := func(buf *[]string, line string, max int) {
+				if max > 0 {
+					*buf = append(*buf, line)
+					if len(*buf) > max {
+						*buf = (*buf)[len(*buf)-max:]
 					}
-				case "stderr":
-					if *streamTail > 0 {
-						push(&bufErr, data, *streamTail)
-					} else {
-						fmt.Fprintln(os.Stderr, data)
+				}
+			}
+			for rd.Scan() {
+				line := rd.Text()
+				if strings.HasPrefix(line, "event:") {
+					lastEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+					continue
+				}
+				if strings.HasPrefix(line, "data:") {
+					data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+					if *save != "" {
+						_ = appendLog(*save, fmt.Sprintf("%s %s\n", lastEvent, data))
 					}
-				case "exit":
-					fmt.Sscanf(data, "%d", &exitCode)
-				case "limit":
-					limited = true
+					switch lastEvent {
+					case "stdout":
+						if *streamTail > 0 {
+							push(&bufOut, data, *streamTail)
+						} else {
+							fmt.Println(data)
+						}
+					case "stderr":
+						if *streamTail > 0 {
+							push(&bufErr, data, *streamTail)
+						} else {
+							fmt.Fprintln(os.Stderr, data)
+						}
+					case "exit":
+						fmt.Sscanf(data, "%d", &exitCode)
+					case "limit":
+						limited = true
+					}
 				}
 			}
-		}
-		if *streamTail > 0 {
-			if limited {
-				fmt.Fprintln(os.Stderr, "[limit] output truncated by server")
-			}
-			if len(bufOut) > 0 {
-				fmt.Fprintf(os.Stdout, "---- stdout (last %d lines) ----\n", len(bufOut))
-				for _, l := range bufOut {
-					fmt.Println(l)
+			resp.Body.Close()
+			cancel2()
+			if *streamTail > 0 {
+				if limited {
+					fmt.Fprintln(os.Stderr, "[limit] output truncated by server")
+				}
+				if len(bufOut) > 0 {
+					fmt.Fprintf(os.Stdout, "---- stdout (last %d lines) ----\n", len(bufOut))
+					for _, l := range bufOut {
+						fmt.Println(l)
+					}
+				}
+				if len(bufErr) > 0 {
+					fmt.Fprintf(os.Stderr, "---- stderr (last %d lines) ----\n", len(bufErr))
+					for _, l := range bufErr {
+						fmt.Fprintln(os.Stderr, l)
+					}
 				}
 			}
-			if len(bufErr) > 0 {
-				fmt.Fprintf(os.Stderr, "---- stderr (last %d lines) ----\n", len(bufErr))
-				for _, l := range bufErr {
-					fmt.Fprintln(os.Stderr, l)
-				}
+			if err := rd.Err(); err != nil && i < attempts-1 {
+				continue
 			}
+			if exitCode != 0 {
+				os.Exit(exitCode)
+			}
+			return
 		}
-		if exitCode != 0 {
-			os.Exit(exitCode)
-		}
-		return
 	}
 	resp, err := http.Post(serverURL()+"/shell/exec", "application/json", strings.NewReader(string(b)))
 	if err != nil {
@@ -1018,6 +1228,7 @@ func hooksCmd(args []string) {
 	targets := fs.String("targets", "", "comma-separated targets (fmt-check,test,lint)")
 	timeout := fs.Int("timeout", 60, "timeout in seconds per target")
 	verbose := fs.Bool("verbose", false, "print each target output")
+	useColor := fs.Bool("color", false, "colorize status and hints")
 	save := fs.String("save", "", "save structured results JSON to project-relative path")
 	_ = fs.Parse(args[1:])
 	if *project == "" {
@@ -1061,9 +1272,21 @@ func hooksCmd(args []string) {
 			}
 			// summary suffix (e.g., 12ms, 10 ln, 120 B)
 			suffix := fmt.Sprintf(" (%dms, %d ln, %d B)", v.DurationMs, v.Lines, v.Bytes)
-			fmt.Printf("  %s %s%s\n", mark, k, suffix)
+			name := k
+			if *useColor {
+				if v.Ok {
+					name = colorGreen(name)
+				} else {
+					name = colorRed(name)
+				}
+			}
+			fmt.Printf("  %s %s%s\n", mark, name, suffix)
 			if v.Suggestion != "" {
-				fmt.Printf("    Hint: %s\n", v.Suggestion)
+				if *useColor {
+					fmt.Printf("    %s %s\n", colorYellow("Hint:"), v.Suggestion)
+				} else {
+					fmt.Printf("    Hint: %s\n", v.Suggestion)
+				}
 			}
 			if *verbose || !v.Ok {
 				// indent output
@@ -1087,9 +1310,21 @@ func hooksCmd(args []string) {
 			failed = true
 		}
 		suffix := fmt.Sprintf(" (%dms, %d ln, %d B)", v.DurationMs, v.Lines, v.Bytes)
-		fmt.Printf("  %s %s%s\n", mark, k, suffix)
+		name := k
+		if *useColor {
+			if v.Ok {
+				name = colorGreen(name)
+			} else {
+				name = colorRed(name)
+			}
+		}
+		fmt.Printf("  %s %s%s\n", mark, name, suffix)
 		if v.Suggestion != "" {
-			fmt.Printf("    Hint: %s\n", v.Suggestion)
+			if *useColor {
+				fmt.Printf("    %s %s\n", colorYellow("Hint:"), v.Suggestion)
+			} else {
+				fmt.Printf("    Hint: %s\n", v.Suggestion)
+			}
 		}
 		if *verbose || !v.Ok {
 			for _, line := range strings.Split(v.Output, "\n") {
@@ -1169,6 +1404,7 @@ func explainCmd(args []string) {
 	project := fs.String("project", "", "project ID")
 	k := fs.Int("k", 7, "retrieval top K")
 	stream := fs.Bool("stream", false, "stream output")
+	color := fs.Bool("color", false, "colorize citations in output")
 	_ = fs.Parse(args)
 	rest := fs.Args()
 	if *project == "" || len(rest) == 0 {
@@ -1202,7 +1438,11 @@ func explainCmd(args []string) {
 				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 				switch lastEvent {
 				case "token":
-					fmt.Print(data)
+					if *color {
+						fmt.Print(highlightCitations(data))
+					} else {
+						fmt.Print(data)
+					}
 				case "error":
 					if data != "" {
 						fmt.Fprintln(os.Stderr, data)
@@ -1211,7 +1451,11 @@ func explainCmd(args []string) {
 					fmt.Println()
 					return
 				default:
-					fmt.Print(data)
+					if *color {
+						fmt.Print(highlightCitations(data))
+					} else {
+						fmt.Print(data)
+					}
 				}
 			}
 		}
@@ -1243,6 +1487,7 @@ func editCmd(args []string) {
 	files := fs.String("files", "", "comma-separated files to focus on")
 	k := fs.Int("k", 8, "retrieval top K")
 	stream := fs.Bool("stream", false, "stream output")
+	color := fs.Bool("color", false, "colorize unified diff output")
 	_ = fs.Parse(args)
 	if *project == "" || *goal == "" {
 		fmt.Println("usage: mycoder edit --project <id> --goal \"<설명>\" [--files a.go,b.go] [--k 8] [--stream]")
@@ -1311,7 +1556,79 @@ func editCmd(args []string) {
 		_, _ = io.Copy(os.Stdout, resp.Body)
 		return
 	}
-	fmt.Println(res.Content)
+	if *color {
+		fmt.Println(colorizeUnifiedDiff(res.Content))
+	} else {
+		fmt.Println(res.Content)
+	}
+}
+
+// highlightCitations wraps path:line or path:start-end segments with cyan.
+func highlightCitations(s string) string {
+	parts := strings.Split(s, " ")
+	for i, p := range parts {
+		if strings.Count(p, ":") == 1 {
+			a := strings.SplitN(p, ":", 2)
+			if len(a) == 2 && a[1] != "" && isDigitsOrRange(a[1]) && looksLikePath(a[0]) {
+				parts[i] = colorCyan(p)
+			}
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func isDigitsOrRange(s string) bool {
+	if s == "" {
+		return false
+	}
+	dash := strings.IndexByte(s, '-')
+	if dash < 0 {
+		for i := 0; i < len(s); i++ {
+			if s[i] < '0' || s[i] > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	left, right := s[:dash], s[dash+1:]
+	if left == "" || right == "" {
+		return false
+	}
+	for i := 0; i < len(left); i++ {
+		if left[i] < '0' || left[i] > '9' {
+			return false
+		}
+	}
+	for i := 0; i < len(right); i++ {
+		if right[i] < '0' || right[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func looksLikePath(s string) bool {
+	return strings.ContainsAny(s, "/.") && !strings.ContainsAny(s, "\t\n\r")
+}
+
+// colorizeUnifiedDiff applies simple ANSI colors to unified diff blocks.
+func colorizeUnifiedDiff(s string) string {
+	var out strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		c := line
+		if strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") || strings.HasPrefix(line, "diff --git") {
+			c = colorCyan(line)
+		} else if strings.HasPrefix(line, "@@") {
+			c = colorCyan(line)
+		} else if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+			c = colorGreen(line)
+		} else if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+			c = colorRed(line)
+		}
+		out.WriteString(c)
+		out.WriteByte('\n')
+	}
+	return out.String()
 }
 
 // mcpCmd lists tools or calls a tool with JSON params
@@ -1338,6 +1655,48 @@ func mcpCmd(args []string) {
 		if *name == "" {
 			fmt.Println("--name required")
 			os.Exit(1)
+		}
+		// best-effort client-side schema validation
+		var params map[string]any
+		if err := json.Unmarshal([]byte(*jsonParams), &params); err != nil {
+			fmt.Fprintln(os.Stderr, "invalid --json params:", err)
+			os.Exit(1)
+		}
+		// fetch tools schema and validate if available
+		if resp, err := http.Get(serverURL() + "/mcp/tools"); err == nil {
+			defer resp.Body.Close()
+			var tools struct {
+				Tools []struct {
+					Name         string `json:"name"`
+					ParamsSchema []struct {
+						Name     string `json:"name"`
+						Type     string `json:"type"`
+						Required bool   `json:"required"`
+					} `json:"paramsSchema"`
+				} `json:"tools"`
+			}
+			_ = json.NewDecoder(resp.Body).Decode(&tools)
+			for _, t := range tools.Tools {
+				if t.Name == *name {
+					for _, p := range t.ParamsSchema {
+						if p.Required {
+							if _, ok := params[p.Name]; !ok {
+								fmt.Fprintf(os.Stderr, "missing required param: %s\n", p.Name)
+								os.Exit(1)
+							}
+						}
+						if p.Type == "string" {
+							if v, ok := params[p.Name]; ok {
+								if _, ok2 := v.(string); !ok2 {
+									fmt.Fprintf(os.Stderr, "param %s must be string\n", p.Name)
+									os.Exit(1)
+								}
+							}
+						}
+					}
+					break
+				}
+			}
 		}
 		body := fmt.Sprintf(`{"name":%q,"params":%s}`, *name, *jsonParams)
 		resp, err := http.Post(serverURL()+"/mcp/call", "application/json", strings.NewReader(body))

@@ -78,8 +78,10 @@ make hook-install
 - `MYCODER_CHAT_SUMMARY_ENABLE`: `1`이면 대화 길이 초과 시 최근 히스토리를 요약해 system 메시지로 앞에 첨부(결정/근거 유지).
 - `MYCODER_CHAT_SUMMARY_THRESHOLD_CHARS`: 요약 트리거 문자 임계(기본 8000).
  - `MYCODER_CONV_TTL_DAYS`: 오래된(업데이트 없는) 비핀(conversations.pinned=0) 대화 삭제 TTL(일, 기본 30).
- - `MYCODER_CONV_CLEAN_INTERVAL`: 대화 정리 주기(기본 24h, 예: `6h`).
- - `MYCODER_CONV_CLEAN_DISABLE`: 설정 시 대화 정리 잡 비활성화.
+- `MYCODER_CONV_CLEAN_INTERVAL`: 대화 정리 주기(기본 24h, 예: `6h`).
+- `MYCODER_CONV_CLEAN_DISABLE`: 설정 시 대화 정리 잡 비활성화.
+ - `MYCODER_API_TOKEN`: 설정 시 모든 API는 토큰 인증 필요(헤더 `Authorization: Bearer <token>` 또는 쿼리 `?token=`). `/healthz`, `/metrics`는 제외 권장.
+ - `MYCODER_READONLY`: `1`이면 쓰기/실행 엔드포인트(`/fs/write|patch|delete`, `/shell/exec*`, `/tools/hooks`, 일부 `/knowledge*`) 차단.
 - 큐레이터(자동 재검증/정리) 관련
   - `MYCODER_CURATOR_DISABLE`: 비우면 활성, 값 설정 시 비활성
   - `MYCODER_CURATOR_INTERVAL`: 주기(`10m` 기본)

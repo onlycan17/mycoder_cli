@@ -1,0 +1,4 @@
+./goextractor.go
+./tsextractor.go
+./goextractor_test.go
+./tsextractor_test.go

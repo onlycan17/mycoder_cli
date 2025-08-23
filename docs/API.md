@@ -3,6 +3,7 @@
 ## 공통
 - Base: `http://localhost:PORT`
 - 인증: 로컬 기본(무), 외부 호출시 프로파일 토큰 사용.
+- 요청 ID: 클라이언트가 `X-Request-ID` 헤더를 지정하면 그대로 반영하고, 없으면 서버가 생성하여 응답헤더 `X-Request-ID`로 반환. 모든 요청 로그에 `req_id` 필드 포함.
 - 스트리밍: `/chat` SSE.
 
 ## POST /chat (SSE)
@@ -128,18 +129,24 @@
 
 ## MCP 연동 API(옵션)
 ### GET /mcp/tools
-- 응답: `{ tools:[{name,description,paramsSchema}...] }`
+- 응답: `{ tools:[{name,description,params,paramsSchema}...] }`
+  - `params`: 구버전 호환을 위한 파라미터 이름 리스트
+  - `paramsSchema`: `{name,type,required}` 스키마 목록(가능 타입: string|number|boolean)
+  - 보안: `MYCODER_MCP_ALLOWED_TOOLS` 설정 시 해당 목록에 포함된 도구만 노출
 
-### POST /mcp/call
-- 요청: `{ tool:string, params:any }`
+- ### POST /mcp/call
+- 요청: `{ name:string, params:object }`
 - 응답: `{ result:any, logs?:string }`
+  - 보안:
+    - `MYCODER_MCP_ALLOWED_TOOLS` 설정 시 목록 외 도구 호출 차단(403)
+    - `MYCODER_MCP_REQUIRED_SCOPE` 설정 시 헤더 `X-MYCODER-Scope: <scope>:<tool>` 필요(예:`mcp:call:echo`)
 ## MCP (Minimal)
 
 - GET `/mcp/tools`
-  - 응답: `{ "tools": [{"name":"echo","description":"...","params":["text"]}, ...] }`
+  - 응답: `{ "tools": [{"name":"echo","description":"...","params":["text"],"paramsSchema":[{"name":"text","type":"string","required":true}]}] }`
 
 - POST `/mcp/call`
-  - 요청: `{ "name": "echo", "params": {"text": "hello"} }`
+  - 요청: `{ "name": "echo", "params": {"text": "hello"} }` (서버가 스키마 기반 검증 수행)
   - 응답: `{ "ok": true, "result": "hello" }` 혹은 `{ "ok": false, "error": "unknown tool" }`
 
 ## 에러 응답 형식(표준)
@@ -154,3 +161,14 @@
   ```
 - 적용 대상: 잘못된 메서드(405), 잘못된 JSON(400), 필수 필드 누락(400), 미존재 리소스(400/404), 내부 오류(500)
 - `/projects`, `/index/run`, `/index/run/stream` 등에서 표준 에러 포맷을 우선 적용했습니다. 나머지 엔드포인트도 순차 교체 예정입니다.
+## Web Enrichment (Optional)
+
+- POST `/web/search`
+  - 요청: `{ "query": string, "limit"?: number }`
+  - 응답: `{ "results": [{"title": string, "url": string, "snippet": string, "score": number}] }`
+  - 비고: 기본은 비활성. `MYCODER_WEB_SEARCH_MOCK=1` 설정 시 모의 결과 반환.
+
+- POST `/web/ingest`
+  - 요청: `{ "projectID": string, "results": [{"title"?:string,"url":string,"snippet"?:string,"score"?:number}], "minScore"?: number, "dedupe"?: boolean }`
+  - 동작: 결과를 정규화/중복 제거 후 Knowledge(sourceType="web")로 저장. 초기 trustScore는 `score` 기반 부여.
+  - 응답: `{ "added": number }`

@@ -36,14 +36,25 @@ func TestToolsHooksRunsTargets(t *testing.T) {
 		t.Fatalf("/tools/hooks code=%d body=%s", rr.Code, rr.Body.String())
 	}
 	var res map[string]struct {
-		Ok     bool   `json:"ok"`
-		Output string `json:"output"`
+		Ok         bool   `json:"ok"`
+		Output     string `json:"output"`
+		DurationMs int    `json:"durationMs"`
+		Lines      int    `json:"lines"`
+		Bytes      int    `json:"bytes"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &res); err != nil {
 		t.Fatalf("json: %v", err)
 	}
 	if !res["fmt-check"].Ok || !res["test"].Ok || !res["lint"].Ok {
 		t.Fatalf("expected all ok, got: %+v", res)
+	}
+	// summary presence and totals
+	sum, ok := res["_summary"]
+	if !ok || !sum.Ok {
+		t.Fatalf("expected summary ok, got: %+v", sum)
+	}
+	if sum.DurationMs <= 0 {
+		t.Fatalf("expected summary duration > 0")
 	}
 }
 
@@ -70,8 +81,9 @@ func TestToolsHooksStopsOnFailure(t *testing.T) {
 		t.Fatalf("/tools/hooks code=%d body=%s", rr.Code, rr.Body.String())
 	}
 	var res map[string]struct {
-		Ok     bool   `json:"ok"`
-		Output string `json:"output"`
+		Ok         bool   `json:"ok"`
+		Output     string `json:"output"`
+		DurationMs int    `json:"durationMs"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &res); err != nil {
 		t.Fatalf("json: %v", err)
@@ -97,6 +109,10 @@ func TestToolsHooksStopsOnFailure(t *testing.T) {
 	}
 	if _, exists := res["lint"]; exists {
 		t.Fatalf("lint should not run after failure")
+	}
+	// summary reflects failure and mentions firstFail
+	if !strings.Contains(res["_summary"].Output, "firstFail=test") || res["_summary"].Ok {
+		t.Fatalf("expected summary to indicate firstFail=test and ok=false: %+v", res["_summary"])
 	}
 }
 

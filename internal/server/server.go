@@ -2,10 +2,13 @@ package server
 
 import (
 	"context"
+	crand "crypto/rand"
 	"fmt"
 	"io"
 	"math/rand"
+	"mycoder/internal/patch"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -64,6 +67,7 @@ type Store interface {
 	PromoteKnowledge(projectID, title, text, pathOrURL, commitSHA, filesCSV, symbolsCSV string, pin bool) (*models.Knowledge, error)
 	ReverifyKnowledge(projectID string) (int, error)
 	GCKnowledge(projectID string, minScore float64) (int, error)
+	ApproveKnowledge(projectID string, ids []string, pin bool, minTrust float64) (int, error)
 }
 
 type IncrementalStore interface {
@@ -222,6 +226,26 @@ type metricsCollector struct {
 	embedCacheEvict  int
 }
 
+// Authorization: optional token via env MYCODER_API_TOKEN.
+// Accepts Authorization: Bearer <token> or query param ?token=...
+func authorize(w http.ResponseWriter, r *http.Request) bool {
+	tok := os.Getenv("MYCODER_API_TOKEN")
+	if tok == "" {
+		return true
+	}
+	hdr := r.Header.Get("Authorization")
+	if strings.HasPrefix(hdr, "Bearer ") && strings.TrimSpace(hdr[len("Bearer "):]) == tok {
+		return true
+	}
+	if r.URL.Query().Get("token") == tok {
+		return true
+	}
+	writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid token")
+	return false
+}
+
+func isReadOnly() bool { return os.Getenv("MYCODER_READONLY") == "1" }
+
 func newMetrics() *metricsCollector {
 	return &metricsCollector{
 		reqTotal: make(map[string]int),
@@ -276,6 +300,9 @@ func (a *API) mux() *http.ServeMux {
 	mux.HandleFunc("/fs/read", a.handleFSRead)
 	mux.HandleFunc("/fs/write", a.handleFSWrite)
 	mux.HandleFunc("/fs/patch", a.handleFSPatch)
+	mux.HandleFunc("/fs/patch/unified", a.handleFSPatchUnified)
+	mux.HandleFunc("/fs/patch/unified/rollback", a.handleFSPatchUnifiedRollback)
+	mux.HandleFunc("/fs/diff", a.handleFSDiff)
 	mux.HandleFunc("/fs/delete", a.handleFSDelete)
 	mux.HandleFunc("/shell/exec", a.handleShellExec)
 	mux.HandleFunc("/shell/exec/stream", a.handleShellExecStream)
@@ -284,7 +311,9 @@ func (a *API) mux() *http.ServeMux {
 	mux.HandleFunc("/knowledge", a.handleKnowledge)
 	mux.HandleFunc("/knowledge/vet", a.handleKnowledgeVet)
 	mux.HandleFunc("/knowledge/promote", a.handleKnowledgePromote)
+	mux.HandleFunc("/knowledge/approve", a.handleKnowledgeApprove)
 	mux.HandleFunc("/knowledge/reverify", a.handleKnowledgeReverify)
+	mux.HandleFunc("/knowledge/pending", a.handleKnowledgePending)
 	mux.HandleFunc("/knowledge/gc", a.handleKnowledgeGC)
 	mux.HandleFunc("/knowledge/promote/auto", a.handleKnowledgePromoteAuto)
 	// tools/hooks
@@ -292,6 +321,9 @@ func (a *API) mux() *http.ServeMux {
 	// mcp tools
 	mux.HandleFunc("/mcp/tools", a.handleMCPTools)
 	mux.HandleFunc("/mcp/call", a.handleMCPCall)
+	// web enrichment (optional)
+	mux.HandleFunc("/web/search", a.handleWebSearch)
+	mux.HandleFunc("/web/ingest", a.handleWebIngest)
 	return mux
 }
 
@@ -356,6 +388,10 @@ func Run(addr string) error {
 					}
 					_, _ = st.ReverifyKnowledge(p.ID)
 					_, _ = st.GCKnowledge(p.ID, minTrust)
+					// TTL-based GC for web knowledge via tags.ttlUntil
+					if ss, ok := st.(*store.SQLiteStore); ok {
+						_, _ = ss.GCKnowledgeTTL(p.ID)
+					}
 				}
 			}
 		}()
@@ -439,14 +475,37 @@ func (sr *statusRecorder) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// newRequestID returns a short, unique request identifier.
+func newRequestID() string {
+	var b [12]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		// fallback: monotonic timestamp string
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	const hexdigits = "0123456789abcdef"
+	out := make([]byte, 24)
+	for i, v := range b {
+		out[i*2] = hexdigits[v>>4]
+		out[i*2+1] = hexdigits[v&0x0f]
+	}
+	return string(out)
+}
+
 func logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		// request-id propagation: accept client-provided or generate
+		reqID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
+		if reqID == "" {
+			reqID = newRequestID()
+		}
+		w.Header().Set("X-Request-ID", reqID)
 		rec := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(rec, r)
 		dur := time.Since(start)
 		lg := mylog.New()
 		lg.Info("http.req",
+			"req_id", reqID,
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rec.status,
@@ -469,11 +528,18 @@ func logMiddleware(next http.Handler) http.Handler {
 
 // Handlers
 func (a *API) handleProjects(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		list := a.store.ListProjects()
 		writeJSON(w, http.StatusOK, list)
 	case http.MethodPost:
+		if isReadOnly() {
+			writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
+			return
+		}
 		var req struct {
 			Name     string   `json:"name"`
 			RootPath string   `json:"rootPath"`
@@ -495,6 +561,9 @@ func (a *API) handleProjects(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleIndexRun(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 		return
@@ -567,8 +636,11 @@ func (a *API) handleIndexRun(w http.ResponseWriter, r *http.Request) {
 
 // SSE streaming version: emits job, progress, completed events while indexing
 func (a *API) handleIndexRunStream(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 		return
 	}
 	var req struct {
@@ -597,7 +669,7 @@ func (a *API) handleIndexRunStream(w http.ResponseWriter, r *http.Request) {
 	}
 	job, err := a.store.CreateIndexJob(req.ProjectID, req.Mode)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	_, _ = a.store.SetJobStatus(job.ID, models.JobRunning, nil)
@@ -690,14 +762,17 @@ func (a *API) handleIndexRunStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleIndexJob(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 		return
 	}
 	// path: /index/jobs/:id
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/index/jobs/"), "/")
 	if len(parts) == 0 || parts[0] == "" {
-		http.Error(w, "job id required", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_request", "job id required")
 		return
 	}
 	id := parts[0]
@@ -705,7 +780,7 @@ func (a *API) handleIndexJob(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, job)
 		return
 	}
-	http.NotFound(w, r)
+	writeError(w, http.StatusNotFound, "not_found", "job not found")
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -725,19 +800,211 @@ func writeError(w http.ResponseWriter, status int, errStr, message string) {
 }
 
 func (a *API) handleSearch(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 		return
 	}
 	q := r.URL.Query().Get("q")
 	if strings.TrimSpace(q) == "" {
-		http.Error(w, "q required", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_request", "q required")
 		return
 	}
 	k := 10
 	pid := r.URL.Query().Get("projectID")
 	results := a.store.Search(pid, q, k)
 	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
+// Web enrichment (optional)
+type webResult struct {
+	Title   string  `json:"title"`
+	URL     string  `json:"url"`
+	Snippet string  `json:"snippet"`
+	Score   float64 `json:"score"`
+}
+
+func (a *API) handleWebSearch(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
+		return
+	}
+	var req struct {
+		Query string
+		Limit int
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Query) == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "query required")
+		return
+	}
+	if req.Limit <= 0 {
+		req.Limit = 5
+	}
+	var results []webResult
+	// mock provider controlled by env (no external network in tests)
+	if os.Getenv("MYCODER_WEB_SEARCH_MOCK") == "1" {
+		for i := 1; i <= req.Limit; i++ {
+			results = append(results, webResult{
+				Title:   fmt.Sprintf("Result %d for %s", i, req.Query),
+				URL:     fmt.Sprintf("https://example.com/%s/%d", strings.ReplaceAll(req.Query, " ", "-"), i),
+				Snippet: "This is a mock snippet.",
+				Score:   1.0 - float64(i-1)*0.1,
+			})
+		}
+	} else {
+		writeError(w, http.StatusServiceUnavailable, "not_configured", "web search not configured")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
+func (a *API) handleWebIngest(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
+		return
+	}
+	var req struct {
+		ProjectID  string      `json:"projectID"`
+		Results    []webResult `json:"results"`
+		MinScore   float64     `json:"minScore"`
+		Dedupe     bool        `json:"dedupe"`
+		TTLDays    int         `json:"ttlDays"`
+		PinOnAdd   bool        `json:"pinOnAdd"`
+		Summarize  bool        `json:"summarize"`
+		SummaryPin bool        `json:"summaryPin"`
+		Query      string      `json:"query"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+		return
+	}
+	if req.ProjectID == "" || len(req.Results) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID and results required")
+		return
+	}
+	if req.MinScore == 0 {
+		req.MinScore = 0.0
+	}
+	seen := map[string]bool{}
+	added := 0
+	for _, r0 := range req.Results {
+		if r0.URL == "" || r0.Score < req.MinScore {
+			continue
+		}
+		key := strings.ToLower(r0.URL)
+		if req.Dedupe {
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+		}
+		// add to knowledge with sourceType=web; trustScore from score
+		title := r0.Title
+		text := r0.Snippet
+		if title == "" {
+			title = r0.URL
+		}
+		if text == "" {
+			text = r0.URL
+		}
+		tr := r0.Score
+		if tr < 0 {
+			tr = 0
+		}
+		if tr > 1 {
+			tr = 1
+		}
+		k, err := a.store.AddKnowledge(req.ProjectID, "web", r0.URL, title, text, tr, req.PinOnAdd)
+		if err == nil {
+			if ss, ok := a.store.(*store.SQLiteStore); ok {
+				tags := map[string]string{}
+				if d := domainFromURL(r0.URL); d != "" {
+					tags["domain"] = d
+				}
+				if req.TTLDays > 0 {
+					tags["ttlUntil"] = time.Now().Add(time.Duration(req.TTLDays) * 24 * time.Hour).Format(time.RFC3339)
+				}
+				if len(tags) > 0 {
+					tb, _ := json.Marshal(tags)
+					_, _ = ss.DB().Exec(`UPDATE knowledge SET tags=? WHERE id=?`, string(tb), k.ID)
+				}
+			}
+			added++
+		}
+	}
+	if req.Summarize {
+		sumText := ""
+		if a.llm != nil {
+			var b strings.Builder
+			for i, r0 := range req.Results {
+				if i >= 8 {
+					break
+				}
+				fmt.Fprintf(&b, "- %s (%s): %s\n", strings.TrimSpace(r0.Title), r0.URL, strings.TrimSpace(r0.Snippet))
+			}
+			sys := llm.Message{Role: llm.RoleSystem, Content: "Summarize these web search results into a concise brief (bullet points)."}
+			usr := llm.Message{Role: llm.RoleUser, Content: b.String()}
+			st, err := a.llm.Chat(r.Context(), os.Getenv("MYCODER_CHAT_MODEL"), []llm.Message{sys, usr}, false, 0)
+			if err == nil {
+				defer st.Close()
+				var buf strings.Builder
+				for {
+					d, done, e := st.Recv()
+					if e != nil {
+						break
+					}
+					buf.WriteString(d)
+					if done {
+						break
+					}
+				}
+				sumText = buf.String()
+			}
+		}
+		if sumText == "" {
+			sumText = "Summary of web search results."
+		}
+		title := "Web Summary"
+		if strings.TrimSpace(req.Query) != "" {
+			title = "Web Summary: " + req.Query
+		}
+		if k, err := a.store.AddKnowledge(req.ProjectID, "web", "", title, sumText, 0.6, req.SummaryPin); err == nil {
+			added++
+			if ss, ok := a.store.(*store.SQLiteStore); ok {
+				tags := map[string]string{"kind": "summary"}
+				if strings.TrimSpace(req.Query) != "" {
+					tags["query"] = req.Query
+				}
+				tb, _ := json.Marshal(tags)
+				_, _ = ss.DB().Exec(`UPDATE knowledge SET tags=? WHERE id=?`, string(tb), k.ID)
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"added": added})
+}
+
+func domainFromURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	h := strings.TrimSpace(u.Host)
+	if i := strings.IndexByte(h, ':'); i >= 0 {
+		h = h[:i]
+	}
+	return h
 }
 
 func (a *API) handleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -826,44 +1093,62 @@ func (a *API) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 // Knowledge handlers
 func (a *API) handleKnowledge(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
 	switch r.Method {
 	case http.MethodPost:
+		if isReadOnly() {
+			writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
+			return
+		}
 		var req struct {
 			ProjectID, SourceType, PathOrURL, Title, Text string
 			TrustScore                                    float64
 			Pinned                                        bool
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" || req.SourceType == "" || req.Text == "" {
-			http.Error(w, "invalid json", http.StatusBadRequest)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+			return
+		}
+		if req.ProjectID == "" || req.SourceType == "" || req.Text == "" {
+			writeError(w, http.StatusBadRequest, "invalid_request", "projectID, sourceType, text required")
 			return
 		}
 		k, err := a.store.AddKnowledge(req.ProjectID, req.SourceType, req.PathOrURL, req.Title, req.Text, req.TrustScore, req.Pinned)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, k)
 	case http.MethodGet:
 		pid := r.URL.Query().Get("projectID")
 		if pid == "" {
-			http.Error(w, "projectID required", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "invalid_request", "projectID required")
 			return
 		}
 		min := 0.0
 		list, err := a.store.ListKnowledge(pid, min)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"knowledge": list})
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 	}
 }
 
 func (a *API) handleKnowledgeVet(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 		return
 	}
 	var req struct{ ProjectID string }
@@ -877,67 +1162,100 @@ func (a *API) handleKnowledgeVet(w http.ResponseWriter, r *http.Request) {
 	}
 	n, err := a.store.VetKnowledge(req.ProjectID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"vettedCount": n})
 }
 
 func (a *API) handleKnowledgePromote(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 		return
 	}
 	var req struct {
 		ProjectID, Title, Text, PathOrURL, CommitSHA, Files, Symbols string
 		Pin                                                          bool
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" || req.Text == "" {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+		return
+	}
+	if req.ProjectID == "" || req.Text == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID and text required")
 		return
 	}
 	k, err := a.store.PromoteKnowledge(req.ProjectID, req.Title, req.Text, req.PathOrURL, req.CommitSHA, req.Files, req.Symbols, req.Pin)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, k)
 }
 
 func (a *API) handleKnowledgeReverify(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 		return
 	}
 	var req struct{ ProjectID string }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+		return
+	}
+	if req.ProjectID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID required")
 		return
 	}
 	n, err := a.store.ReverifyKnowledge(req.ProjectID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"updated": n})
 }
 
 func (a *API) handleKnowledgeGC(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 		return
 	}
 	var req struct {
-		ProjectID string
-		Min       float64
+		ProjectID string  `json:"projectID"`
+		Min       float64 `json:"minScore"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+		return
+	}
+	if req.ProjectID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID required")
 		return
 	}
 	n, err := a.store.GCKnowledge(req.ProjectID, req.Min)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"removed": n})
@@ -945,8 +1263,15 @@ func (a *API) handleKnowledgeGC(w http.ResponseWriter, r *http.Request) {
 
 // Auto-promote: summarize given files with LLM (if configured) and create Knowledge.
 func (a *API) handleKnowledgePromoteAuto(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 		return
 	}
 	var req struct {
@@ -955,12 +1280,16 @@ func (a *API) handleKnowledgePromoteAuto(w http.ResponseWriter, r *http.Request)
 		Title     string
 		Pin       bool
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+		return
+	}
+	if req.ProjectID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID required")
 		return
 	}
 	if len(req.Files) == 0 {
-		http.Error(w, "files required", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_request", "files required")
 		return
 	}
 	// read snippets from files (cap budget)
@@ -1031,7 +1360,7 @@ func (a *API) handleKnowledgePromoteAuto(w http.ResponseWriter, r *http.Request)
 	filesCSV := strings.Join(req.Files, ",")
 	k, err := a.store.PromoteKnowledge(req.ProjectID, title, summary, p.RootPath, "", filesCSV, "", req.Pin)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, k)
@@ -1039,8 +1368,15 @@ func (a *API) handleKnowledgePromoteAuto(w http.ResponseWriter, r *http.Request)
 
 // POST /tools/hooks: run project hooks (fmt-check, test, lint) in project root.
 func (a *API) handleToolsHooks(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
 		return
 	}
 	var req struct {
@@ -1117,6 +1453,43 @@ func (a *API) handleToolsHooks(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	// add synthetic summary across executed targets
+	{
+		totalMs, totalLines, totalBytes := 0, 0, 0
+		nOk, nFail := 0, 0
+		firstFail := ""
+		firstFailSug := ""
+		for _, t := range targets {
+			if r, exists := out[t]; exists {
+				totalMs += r.DurationMs
+				totalLines += r.Lines
+				totalBytes += r.Bytes
+				if r.Ok {
+					nOk++
+				} else {
+					nFail++
+					if firstFail == "" {
+						firstFail = t
+						firstFailSug = r.Suggestion
+					}
+				}
+			}
+		}
+		overallOk := nFail == 0 && len(out) > 0
+		msg := fmt.Sprintf("targets=%d ok=%d fail=%d", len(out), nOk, nFail)
+		if firstFail != "" {
+			msg += ", firstFail=" + firstFail
+		}
+		out["_summary"] = HooksResult{
+			Ok:         overallOk,
+			Output:     msg,
+			Suggestion: firstFailSug,
+			Reason:     "summary",
+			DurationMs: totalMs,
+			Lines:      totalLines,
+			Bytes:      totalBytes,
+		}
+	}
 	// optionally save artifact JSON to project-relative path
 	if strings.TrimSpace(req.Artifact) != "" {
 		saveHooksArtifact(p.RootPath, req.ProjectID, req.Targets, out, req.Artifact)
@@ -1125,40 +1498,104 @@ func (a *API) handleToolsHooks(w http.ResponseWriter, r *http.Request) {
 }
 
 // Minimal MCP-like tools registry (safe, demo-level)
+type mcpParam struct {
+	Name     string `json:"name"`
+	Type     string `json:"type"` // string|number|boolean
+	Required bool   `json:"required"`
+}
+
 type mcpTool struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Params      []string `json:"params"`
+	Name         string     `json:"name"`
+	Description  string     `json:"description"`
+	Params       []string   `json:"params"`
+	ParamsSchema []mcpParam `json:"paramsSchema"`
+}
+
+func allowedToolsFromEnv() map[string]bool {
+	v := strings.TrimSpace(os.Getenv("MYCODER_MCP_ALLOWED_TOOLS"))
+	if v == "" {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, p := range strings.Split(v, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out[p] = true
+		}
+	}
+	return out
+}
+
+// mcpAuthorized enforces tool-level policy:
+//   - Allowlist via env MYCODER_MCP_ALLOWED_TOOLS (csv). If set, only listed tools are allowed.
+//   - Optional scope via env MYCODER_MCP_REQUIRED_SCOPE (e.g., "mcp:call").
+//     Requires header X-MYCODER-Scope to equal REQUIRED_SCOPE+":"+tool.
+func mcpAuthorized(r *http.Request, tool string) (bool, string) {
+	allow := allowedToolsFromEnv()
+	if allow != nil && !allow[tool] {
+		return false, "tool not allowed"
+	}
+	if base := strings.TrimSpace(os.Getenv("MYCODER_MCP_REQUIRED_SCOPE")); base != "" {
+		want := base + ":" + tool
+		got := strings.TrimSpace(r.Header.Get("X-MYCODER-Scope"))
+		if got != want {
+			return false, "missing or invalid scope"
+		}
+	}
+	return true, ""
 }
 
 func (a *API) handleMCPTools(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 		return
 	}
-	tools := []mcpTool{
-		{Name: "echo", Description: "Echo back the provided text", Params: []string{"text"}},
-		{Name: "time", Description: "Return server time RFC3339", Params: []string{}},
+	full := []mcpTool{
+		{Name: "echo", Description: "Echo back the provided text", Params: []string{"text"}, ParamsSchema: []mcpParam{{Name: "text", Type: "string", Required: true}}},
+		{Name: "time", Description: "Return server time RFC3339", Params: []string{}, ParamsSchema: []mcpParam{}},
+	}
+	// filter by allowlist if provided
+	allow := allowedToolsFromEnv()
+	tools := make([]mcpTool, 0, len(full))
+	for _, t := range full {
+		if allow == nil || allow[t.Name] {
+			tools = append(tools, t)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"tools": tools})
 }
 
 func (a *API) handleMCPCall(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 		return
 	}
 	var req struct {
-		Name   string            `json:"name"`
-		Params map[string]string `json:"params"`
+		Name   string         `json:"name"`
+		Params map[string]any `json:"params"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body or missing name")
+		return
+	}
+	if ok, reason := mcpAuthorized(r, req.Name); !ok {
+		writeError(w, http.StatusForbidden, "forbidden", reason)
 		return
 	}
 	switch req.Name {
 	case "echo":
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": req.Params["text"]})
+		// validate params
+		v, ok := req.Params["text"]
+		if !ok {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "missing param: text"})
+			return
+		}
+		s, ok := v.(string)
+		if !ok {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "param text must be string"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": s})
 	case "time":
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": time.Now().Format(time.RFC3339)})
 	default:
@@ -1300,80 +1737,109 @@ func countLines(s string) int {
 
 // FS handlers (project-root confined)
 func (a *API) handleFSRead(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
 		return
 	}
 	var req struct{ ProjectID, Path string }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" || req.Path == "" {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+		return
+	}
+	if req.ProjectID == "" || req.Path == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID and path required")
 		return
 	}
 	root, full, ok := a.resolveProjectPath(req.ProjectID, req.Path)
 	_ = root
 	if !ok {
-		http.Error(w, "path outside project", http.StatusForbidden)
+		writeError(w, http.StatusForbidden, "forbidden", "path outside project")
 		return
 	}
 	b, err := os.ReadFile(full)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "not_found", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"path": req.Path, "content": string(b)})
 }
 
 func (a *API) handleFSWrite(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
 		return
 	}
 	var req struct{ ProjectID, Path, Content string }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" || req.Path == "" {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+		return
+	}
+	if req.ProjectID == "" || req.Path == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID and path required")
 		return
 	}
 	_, full, ok := a.resolveProjectPath(req.ProjectID, req.Path)
 	if !ok {
-		http.Error(w, "path outside project", http.StatusForbidden)
+		writeError(w, http.StatusForbidden, "forbidden", "path outside project")
 		return
 	}
 	if ok, reason := fsAllowed(req.Path); !ok {
-		http.Error(w, reason, http.StatusForbidden)
+		writeError(w, http.StatusForbidden, "forbidden", reason)
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 	if err := os.WriteFile(full, []byte(req.Content), 0o644); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (a *API) handleFSDelete(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
 		return
 	}
 	var req struct{ ProjectID, Path string }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" || req.Path == "" {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+		return
+	}
+	if req.ProjectID == "" || req.Path == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID and path required")
 		return
 	}
 	_, full, ok := a.resolveProjectPath(req.ProjectID, req.Path)
 	if !ok {
-		http.Error(w, "path outside project", http.StatusForbidden)
+		writeError(w, http.StatusForbidden, "forbidden", "path outside project")
 		return
 	}
 	if ok, reason := fsAllowed(req.Path); !ok {
-		http.Error(w, reason, http.StatusForbidden)
+		writeError(w, http.StatusForbidden, "forbidden", reason)
 		return
 	}
 	if err := os.Remove(full); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -1402,8 +1868,15 @@ func (a *API) resolveProjectPath(projectID, rel string) (string, string, bool) {
 }
 
 func (a *API) handleFSPatch(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
 		return
 	}
 	var req struct {
@@ -1459,9 +1932,303 @@ func (a *API) handleFSPatch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (a *API) handleShellExec(w http.ResponseWriter, r *http.Request) {
+// handleFSPatchUnified parses a unified diff and returns a dry-run summary.
+// For Phase 1, only dryRun is supported (no write side-effects).
+func (a *API) handleFSPatchUnified(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
+		return
+	}
+	var req struct {
+		ProjectID string `json:"projectID"`
+		DiffText  string `json:"diffText"`
+		DryRun    bool   `json:"dryRun"`
+		Yes       bool   `json:"yes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+		return
+	}
+	if req.ProjectID == "" || strings.TrimSpace(req.DiffText) == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID and diffText required")
+		return
+	}
+	// parse unified diff
+	files, err := patch.ParseUnified(req.DiffText)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	type fsum struct {
+		Path         string `json:"path"`
+		Add          int    `json:"add"`
+		Del          int    `json:"del"`
+		WrittenBytes int    `json:"writtenBytes"`
+		Conflict     string `json:"conflict,omitempty"`
+	}
+	var list []fsum
+	totalAdd, totalDel := 0, 0
+	for _, f := range files {
+		add, del := 0, 0
+		for _, h := range f.Hunks {
+			for _, ln := range h.Lines {
+				if ln.Kind == patch.Added {
+					add++
+				}
+				if ln.Kind == patch.Deleted {
+					del++
+				}
+			}
+		}
+		totalAdd += add
+		totalDel += del
+		p := f.NewPath
+		if p == "" {
+			p = f.OldPath
+		}
+		list = append(list, fsum{Path: p, Add: add, Del: del})
+	}
+	// Dry-run summary or require confirmation
+	var reqMap map[string]any
+	if err := json.NewDecoder(strings.NewReader("{}")); err == nil {
+		_ = reqMap
+	}
+	// if dry-run or no yes flag -> return summary
+	// Note: extend request to accept 'yes' for application
+	// (kept optional for backward compatibility)
+	// Decode again to capture 'yes' if present
+	// We already decoded into req above; treat missing as false.
+	if req.DryRun || !req.Yes {
+		if !req.DryRun && !req.Yes {
+			writeError(w, http.StatusBadRequest, "invalid_request", "confirmation required: set yes=true or use dryRun")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dryRun": true, "files": list, "totalAdd": totalAdd, "totalDel": totalDel})
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
+		return
+	}
+	// Apply changes; stop on first conflict
+	written := 0
+	// determine project root for backups
+	p, ok := a.store.GetProject(req.ProjectID)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_request", "project not found")
+		return
+	}
+	// prepare backup dir
+	patchID := fmt.Sprintf("pt-%d-%d", time.Now().UnixNano(), rand.Intn(1000))
+	backupDir := filepath.Join(p.RootPath, ".mycoder", "patches", patchID, "files")
+	for i := range files {
+		f := &files[i]
+		// decide operation and target path
+		op := "modify"
+		rel := f.NewPath
+		if f.OldPath == "/dev/null" {
+			op = "create"
+			rel = f.NewPath
+		}
+		if f.NewPath == "/dev/null" {
+			op = "delete"
+			rel = f.OldPath
+		}
+		if strings.TrimSpace(rel) == "" {
+			rel = f.OldPath
+		}
+		_, full, ok := a.resolveProjectPath(req.ProjectID, rel)
+		if !ok {
+			list[i].Conflict = "path outside project"
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "files": list, "totalAdd": totalAdd, "totalDel": totalDel})
+			return
+		}
+		b, err := os.ReadFile(full)
+		if err != nil {
+			if op == "create" {
+				b = []byte("")
+			} else {
+				list[i].Conflict = "file not found"
+				writeJSON(w, http.StatusOK, map[string]any{"ok": false, "files": list, "totalAdd": totalAdd, "totalDel": totalDel})
+				return
+			}
+		}
+		// backup original content
+		bkp := filepath.Join(backupDir, rel)
+		if err := os.MkdirAll(filepath.Dir(bkp), 0o755); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			return
+		}
+		if err := os.WriteFile(bkp, b, 0o644); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			return
+		}
+		newContent, addLines, delLines, err := patch.ApplyToContentOpt(string(b), f.Hunks, patch.ApplyOptions{IgnoreWhitespace: strings.Contains(strings.ToLower(r.URL.RawQuery), "ignorews=1")})
+		if err != nil {
+			list[i].Conflict = err.Error()
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "files": list, "totalAdd": totalAdd, "totalDel": totalDel})
+			return
+		}
+		if addLines != list[i].Add || delLines != list[i].Del {
+			list[i].Conflict = "stats mismatch"
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "files": list, "totalAdd": totalAdd, "totalDel": totalDel})
+			return
+		}
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			return
+		}
+		if op == "delete" {
+			if err := os.Remove(full); err != nil {
+				writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+				return
+			}
+			list[i].WrittenBytes = 0
+		} else {
+			if err := os.WriteFile(full, []byte(newContent), 0o644); err != nil {
+				writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+				return
+			}
+			list[i].WrittenBytes = len(newContent)
+			written += len(newContent)
+		}
+	}
+	// record patch if sqlite
+	if ss, ok := a.store.(*store.SQLiteStore); ok {
+		meta := map[string]any{"type": "unified", "files": list, "diffTextBytes": len(req.DiffText)}
+		mb, _ := json.Marshal(meta)
+		_, _ = ss.DB().Exec(`INSERT INTO patches(id,project_id,path,hunks,applied,created_at,applied_at) VALUES(?,?,?,?,?,?,?)`,
+			patchID, req.ProjectID, "<multi>", string(mb), 1, time.Now().Format(time.RFC3339), time.Now().Format(time.RFC3339))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "patchID": patchID, "files": list, "totalAdd": totalAdd, "totalDel": totalDel, "writtenBytes": written})
+}
+
+// Rollback previously applied unified patch using backups stored under .mycoder/patches/<patchID>/files.
+func (a *API) handleFSPatchUnifiedRollback(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
+		return
+	}
+	var req struct {
+		ProjectID, PatchID string
+		DryRun             bool `json:"dryRun"`
+		Yes                bool `json:"yes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" || req.PatchID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID and patchID required")
+		return
+	}
+	p, ok := a.store.GetProject(req.ProjectID)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_request", "project not found")
+		return
+	}
+	backupRoot := filepath.Join(p.RootPath, ".mycoder", "patches", req.PatchID, "files")
+	var files []string
+	_ = filepath.Walk(backupRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, _ := filepath.Rel(backupRoot, path)
+		files = append(files, rel)
+		return nil
+	})
+	if len(files) == 0 {
+		writeError(w, http.StatusNotFound, "not_found", "backup not found")
+		return
+	}
+	if req.DryRun || !req.Yes {
+		if !req.DryRun && !req.Yes {
+			writeError(w, http.StatusBadRequest, "invalid_request", "confirmation required: set yes=true or use dryRun")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dryRun": true, "files": files})
+		return
+	}
+	written := 0
+	for _, rel := range files {
+		src := filepath.Join(backupRoot, rel)
+		_, dst, ok := a.resolveProjectPath(req.ProjectID, rel)
+		if !ok {
+			writeError(w, http.StatusForbidden, "forbidden", "path outside project")
+			return
+		}
+		b, err := os.ReadFile(src)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			return
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			return
+		}
+		if err := os.WriteFile(dst, b, 0o644); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			return
+		}
+		written += len(b)
+	}
+	if ss, ok := a.store.(*store.SQLiteStore); ok {
+		_, _ = ss.DB().Exec(`UPDATE patches SET applied=0 WHERE id=?`, req.PatchID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restored": len(files), "writtenBytes": written})
+}
+
+// handleFSDiff returns a unified diff between the current file content and provided newContent.
+func (a *API) handleFSDiff(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
+		return
+	}
+	var req struct {
+		ProjectID, Path, NewContent string
+		Context                     int
+		IgnoreCRLF                  bool
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" || req.Path == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID and path required")
+		return
+	}
+	_, full, ok := a.resolveProjectPath(req.ProjectID, req.Path)
+	if !ok {
+		writeError(w, http.StatusForbidden, "forbidden", "path outside project")
+		return
+	}
+	oldB, err := os.ReadFile(full)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", err.Error())
+		return
+	}
+	diff := patch.GenerateUnified(string(oldB), req.NewContent, req.Path, req.Context, req.IgnoreCRLF)
+	writeJSON(w, http.StatusOK, map[string]any{"diffText": diff})
+}
+
+func (a *API) handleShellExec(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
 		return
 	}
 	var req struct {
@@ -1471,13 +2238,17 @@ func (a *API) handleShellExec(w http.ResponseWriter, r *http.Request) {
 		Cwd            string            `json:"cwd"`
 		Env            map[string]string `json:"env"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" || req.Cmd == "" {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+		return
+	}
+	if req.ProjectID == "" || req.Cmd == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID and cmd required")
 		return
 	}
 	p, ok := a.store.GetProject(req.ProjectID)
 	if !ok {
-		http.Error(w, "project not found", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_request", "project not found")
 		return
 	}
 	to := time.Duration(30) * time.Second
@@ -1490,7 +2261,7 @@ func (a *API) handleShellExec(w http.ResponseWriter, r *http.Request) {
 	cmdline := buildCmdline(req.Cmd, req.Args)
 	cmd := exec.CommandContext(ctx, "/bin/zsh", "-lc", cmdline)
 	if ok, reason := shellAllowed(cmdline); !ok {
-		writeJSON(w, http.StatusForbidden, map[string]any{"error": reason})
+		writeError(w, http.StatusForbidden, "forbidden", reason)
 		return
 	}
 	// resolve cwd under project root if provided
@@ -1527,8 +2298,15 @@ func (a *API) handleShellExec(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleShellExecStream(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
 		return
 	}
 	var req struct {
@@ -1538,13 +2316,17 @@ func (a *API) handleShellExecStream(w http.ResponseWriter, r *http.Request) {
 		Cwd            string            `json:"cwd"`
 		Env            map[string]string `json:"env"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" || req.Cmd == "" {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+		return
+	}
+	if req.ProjectID == "" || req.Cmd == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID and cmd required")
 		return
 	}
 	p, ok := a.store.GetProject(req.ProjectID)
 	if !ok {
-		http.Error(w, "project not found", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_request", "project not found")
 		return
 	}
 	to := time.Duration(60) * time.Second
@@ -1587,7 +2369,7 @@ func (a *API) handleShellExecStream(w http.ResponseWriter, r *http.Request) {
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 	if err := cmd.Start(); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -2291,4 +3073,82 @@ func (a *API) maybeSummarize(messages []llm.Message, projectID string) []llm.Mes
 	out = append(out, sys)
 	out = append(out, messages...)
 	return out
+}
+
+// handleKnowledgeApprove manually approves knowledge items by id: pin=true and raise trust to minTrust.
+func (a *API) handleKnowledgeApprove(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
+	if isReadOnly() {
+		writeError(w, http.StatusForbidden, "forbidden", "read-only mode")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
+		return
+	}
+	var req struct {
+		ProjectID  string
+		IDs        []string
+		Pin        bool
+		MinTrust   float64
+		ApprovedBy string
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ProjectID == "" || len(req.IDs) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID and ids required")
+		return
+	}
+	if req.MinTrust == 0 {
+		req.MinTrust = 0.8
+	}
+	n, err := a.store.ApproveKnowledge(req.ProjectID, req.IDs, true, req.MinTrust)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"approved": n})
+}
+
+// handleKnowledgePending lists unpinned knowledge items (optionally filter by sourceType and minTrust).
+func (a *API) handleKnowledgePending(w http.ResponseWriter, r *http.Request) {
+	if !authorize(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
+		return
+	}
+	pid := r.URL.Query().Get("projectID")
+	if pid == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "projectID required")
+		return
+	}
+	src := r.URL.Query().Get("sourceType")
+	min := 0.0
+	if v := r.URL.Query().Get("minTrust"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			min = f
+		}
+	}
+	list, err := a.store.ListKnowledge(pid, min)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	type item struct {
+		ID, SourceType, PathOrURL, Title string
+		Trust                            float64
+	}
+	var out []item
+	for _, k := range list {
+		if k.Pinned {
+			continue
+		}
+		if src != "" && k.SourceType != src {
+			continue
+		}
+		out = append(out, item{ID: k.ID, SourceType: k.SourceType, PathOrURL: k.PathOrURL, Title: k.Title, Trust: k.TrustScore})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"pending": out})
 }

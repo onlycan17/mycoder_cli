@@ -285,3 +285,28 @@ func (s *Store) GCKnowledge(projectID string, minScore float64) (int, error) {
 	s.knowledge = kept
 	return removed, nil
 }
+
+func (s *Store) ApproveKnowledge(projectID string, ids []string, pin bool, minTrust float64) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idset := map[string]struct{}{}
+	for _, id := range ids {
+		idset[id] = struct{}{}
+	}
+	n := 0
+	for _, k := range s.knowledge {
+		if k.ProjectID != projectID {
+			continue
+		}
+		if _, ok := idset[k.ID]; ok {
+			if pin {
+				k.Pinned = true
+			}
+			if k.TrustScore < minTrust {
+				k.TrustScore = minTrust
+			}
+			n++
+		}
+	}
+	return n, nil
+}

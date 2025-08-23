@@ -13,6 +13,9 @@ import (
 )
 
 func TestChatRetriesOn429(t *testing.T) {
+	if os.Getenv("MYCODER_SKIP_NET_TESTS") == "1" {
+		t.Skip("skipping network-bound test in restricted env")
+	}
 	var calls int32
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {

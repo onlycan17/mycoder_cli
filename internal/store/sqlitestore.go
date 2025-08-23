@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -54,6 +55,10 @@ func dirOf(path string) string {
 	}
 	return "."
 }
+
+// DB exposes underlying *sql.DB for internal helpers (e.g., metadata tags update).
+// Not part of the generic Store interface; use sparingly.
+func (s *SQLiteStore) DB() *sql.DB { return s.db }
 
 // WithTx provides a simple transaction wrapper that commits on nil error
 // and rolls back on error. The callback must not hold the tx beyond return.
@@ -801,6 +806,47 @@ func (s *SQLiteStore) GCKnowledge(projectID string, minScore float64) (int, erro
 	return int(n), nil
 }
 
+// GCKnowledgeTTL removes non-pinned knowledge items whose tags.ttlUntil is in the past.
+// Since SQLite JSON1 may not be available, we parse tags in Go and delete expired rows.
+func (s *SQLiteStore) GCKnowledgeTTL(projectID string) (int, error) {
+	rows, err := s.db.Query(`SELECT id, tags FROM knowledge WHERE project_id=? AND pinned=0 AND tags IS NOT NULL`, projectID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	type rec struct{ id, tags string }
+	var expired []string
+	for rows.Next() {
+		var id, tags string
+		if err := rows.Scan(&id, &tags); err == nil {
+			// naive json parse into map[string]string
+			var m map[string]string
+			if err := json.Unmarshal([]byte(tags), &m); err == nil {
+				if until, ok := m["ttlUntil"]; ok && until != "" {
+					if t, err := time.Parse(time.RFC3339, until); err == nil && time.Now().After(t) {
+						expired = append(expired, id)
+					}
+				}
+			}
+		}
+	}
+	if len(expired) == 0 {
+		return 0, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	for _, id := range expired {
+		_, _ = tx.Exec(`DELETE FROM knowledge WHERE id=?`, id)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(expired), nil
+}
+
 // DecayKnowledge reduces trust_score by rate for non-pinned items older than afterDays since last verify/create.
 func (s *SQLiteStore) DecayKnowledge(projectID string, rate float64, afterDays int) (int, error) {
 	if rate <= 0 {
@@ -865,4 +911,19 @@ func (s *SQLiteStore) cleanupConversationIDs(ids []string) (int, error) {
 		return 0, err
 	}
 	return len(ids), nil
+}
+
+func (s *SQLiteStore) ApproveKnowledge(projectID string, ids []string, pin bool, minTrust float64) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	n := 0
+	for _, id := range ids {
+		_, err := s.db.Exec(`UPDATE knowledge SET pinned = CASE WHEN ? THEN 1 ELSE pinned END, trust_score = CASE WHEN trust_score < ? THEN ? ELSE trust_score END WHERE project_id=? AND id=?`, pin, minTrust, minTrust, projectID, id)
+		if err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
 }

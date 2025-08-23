@@ -1,0 +1,12 @@
+./memstore.go
+./repository.go
+./sqlitestore.go
+./knowledge_vet_test.go
+./sqlitestore_conversation_cleanup_test.go
+./sqlitestore_crud_test.go
+./sqlitestore_docchunk_test.go
+./sqlitestore_exec_test.go
+./sqlitestore_knowledge_ttl_test.go
+./sqlitestore_symbols_test.go
+./sqlitestore_symedges_test.go
+./sqlitestore_test.go

@@ -1,0 +1,3 @@
+# test log
+getenv MYCODER_HYBRID_ALPHA
+getenv MYCODER_EMBEDDING_MODEL

@@ -1,0 +1,3 @@
+./migrate.go
+./migrations.go
+./migrations_test.go
