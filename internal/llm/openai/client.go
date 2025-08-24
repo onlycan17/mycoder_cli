@@ -29,7 +29,7 @@ func NewFromEnv() *Client {
 	base := os.Getenv("MYCODER_OPENAI_BASE_URL")
 	if base == "" {
 		// 기본을 LM Studio 외부 접근 가능한 호스트로 설정
-		base = "http://192.168.0.227:3620/v1"
+		base = "http://210.126.109.57:3620/v1"
 	}
 	key := os.Getenv("MYCODER_OPENAI_API_KEY")
 	gap := time.Duration(0)
@@ -87,6 +87,10 @@ func (s *chatStream) Close() error { return s.body.Close() }
 func (c *Client) Chat(ctx context.Context, model string, messages []llm.Message, stream bool, temperature float32) (llm.ChatStream, error) {
 	if model == "" {
 		model = os.Getenv("MYCODER_CHAT_MODEL")
+		if model == "" {
+			// 기본 모델 설정
+			model = "qwen2.5-7b-instruct-1m"
+		}
 	}
 	reqBody := map[string]any{
 		"model":       model,
@@ -149,6 +153,10 @@ func (s *staticStream) Close() error { return nil }
 func (c *Client) Embeddings(ctx context.Context, model string, inputs []string) ([][]float32, error) {
 	if model == "" {
 		model = os.Getenv("MYCODER_EMBEDDING_MODEL")
+		if model == "" {
+			// 기본 임베딩 모델 설정
+			model = "text-embedding-nomic-embed-text-v1.5"
+		}
 	}
 	reqBody := map[string]any{
 		"model": model,

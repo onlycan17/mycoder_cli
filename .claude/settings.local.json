@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(lsof:*)",
+      "Bash(make:*)",
+      "Bash(curl:*)",
+      "Bash(./bin/mycoder)",
+      "Bash(pkill:*)",
+      "Read(//private/tmp/**)",
+      "Bash(./bin/mycoder:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

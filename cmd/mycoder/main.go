@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"strings"
@@ -436,7 +437,7 @@ func modelsCmd(args []string) {
 	_ = fs.Parse(args)
 	base := os.Getenv("MYCODER_OPENAI_BASE_URL")
 	if base == "" {
-		base = "http://192.168.0.227:3620/v1"
+		base = "http://210.126.109.57:3620/v1"
 	}
 	url := strings.TrimRight(base, "/") + "/models"
 	req, _ := http.NewRequest(http.MethodGet, url, nil)
@@ -1830,7 +1831,7 @@ func interactiveChatMode() {
 	serverURL := getServerURL()
 	if !isServerRunning(serverURL) {
 		fmt.Printf("⚠️  Server not running. Starting server at %s...\n", serverURL)
-		go startServerInBackground()
+		startServerInBackground()
 		// Wait a bit for server to start
 		fmt.Println("⏳ Waiting for server to start...")
 		waitForServerReady(serverURL, 10)
@@ -1844,6 +1845,18 @@ func interactiveChatMode() {
 	}
 
 	fmt.Printf("📁 Using project: %s\n", projectID)
+	
+	// Auto-index the project if needed
+	fmt.Println("🔍 Checking project index status...")
+	if shouldIndexProject(serverURL, projectID) {
+		fmt.Println("📚 Indexing project files for better analysis...")
+		go indexProjectInBackground(serverURL, projectID)
+		// Don't wait for indexing to complete, let it run in background
+		fmt.Println("✅ Indexing started in background")
+	} else {
+		fmt.Println("✅ Project index is up to date")
+	}
+	
 	fmt.Println("────────────────────────────────────────────────────────────────")
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -1905,9 +1918,11 @@ func isServerRunning(serverURL string) bool {
 }
 
 func startServerInBackground() {
-	// Start server in background
-	// This is a simple approach - in production you might want more sophisticated process management
-	if err := server.Run(":8089"); err != nil {
+	// Start server in background using exec.Command for proper process management
+	cmd := exec.Command(os.Args[0], "serve", "--addr", ":8089")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start server: %v\n", err)
 	}
 }
@@ -1973,7 +1988,7 @@ func getOrCreateDefaultProject(serverURL string) string {
 }
 
 func sendChatRequest(serverURL, projectID, message string) string {
-	client := &http.Client{}
+	client := &http.Client{Timeout: 30 * time.Second}
 
 	requestBody := map[string]interface{}{
 		"messages": []map[string]string{
@@ -1992,7 +2007,8 @@ func sendChatRequest(serverURL, projectID, message string) string {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return fmt.Sprintf("❌ Server error: %s", resp.Status)
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Sprintf("❌ Server error: %s - %s", resp.Status, string(body))
 	}
 
 	var response map[string]interface{}
@@ -2078,5 +2094,110 @@ func handleIndexCommand(input, projectID, serverURL string) {
 		fmt.Println("✅ Indexing started successfully")
 	} else {
 		fmt.Printf("❌ Indexing failed: %s\n", resp.Status)
+	}
+}
+
+// shouldIndexProject checks if the project needs indexing
+func shouldIndexProject(serverURL, projectID string) bool {
+	// Check if project has been indexed before
+	client := &http.Client{Timeout: 2 * time.Second}
+	
+	// Try to search for a test query to see if index exists
+	testQuery := "main"
+	url := fmt.Sprintf("%s/search?q=%s&projectID=%s", serverURL, testQuery, projectID)
+	
+	resp, err := client.Get(url)
+	if err != nil {
+		// If error, assume needs indexing
+		return true
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		// If not successful, needs indexing
+		return true
+	}
+	
+	// Check if we have any results
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return true
+	}
+	
+	// If results exist, check if they're empty
+	if results, ok := result["results"].([]interface{}); ok {
+		if len(results) == 0 {
+			// No indexed documents, needs indexing
+			return true
+		}
+		// Has indexed documents, check age (for now, skip if already indexed)
+		return false
+	}
+	
+	// Default to indexing if uncertain
+	return true
+}
+
+// indexProjectInBackground indexes the project in the background
+func indexProjectInBackground(serverURL, projectID string) {
+	client := &http.Client{Timeout: 60 * time.Second}
+	requestBody := map[string]interface{}{
+		"projectID": projectID,
+		"mode":      "full",
+		"maxFiles":  1000,  // Limit for initial indexing
+	}
+
+	jsonData, _ := json.Marshal(requestBody)
+	resp, err := client.Post(serverURL+"/index/run", "application/json", strings.NewReader(string(jsonData)))
+	if err != nil {
+		fmt.Printf("\n⚠️  Background indexing error: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		var result map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+			if jobID, ok := result["jobID"].(string); ok {
+				// Monitor job status
+				monitorIndexingJob(serverURL, jobID)
+			}
+		}
+	}
+}
+
+// monitorIndexingJob monitors the indexing job status
+func monitorIndexingJob(serverURL, jobID string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	maxAttempts := 30 // Monitor for max 30 seconds
+	
+	for i := 0; i < maxAttempts; i++ {
+		time.Sleep(1 * time.Second)
+		
+		resp, err := client.Get(fmt.Sprintf("%s/index/jobs/%s", serverURL, jobID))
+		if err != nil {
+			continue
+		}
+		
+		var job map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+			resp.Body.Close()
+			continue
+		}
+		resp.Body.Close()
+		
+		if status, ok := job["status"].(string); ok {
+			if status == "completed" {
+				if stats, ok := job["stats"].(map[string]interface{}); ok {
+					if indexed, ok := stats["indexed"].(float64); ok {
+						fmt.Printf("\n✅ Indexing completed: %d files indexed\n💬 > ", int(indexed))
+					}
+				}
+				return
+			} else if status == "failed" {
+				fmt.Printf("\n⚠️  Indexing failed\n💬 > ")
+				return
+			}
+		}
 	}
 }

@@ -1,0 +1,50 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+/tmp/
+
+# Database
+*.db
+*.sqlite
+
+# Archives
+*.tar.gz
+*.zip
+
+# Project specific
+mycoder-cli.tar.gz
+.serena/

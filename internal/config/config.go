@@ -34,7 +34,13 @@ var KnownKeys = []string{
 // LoadAndApply loads configuration from ~/.mycoder/config.yaml (or .yml/.json)
 // and applies values into the process environment for known keys if they are
 // not already set. Environment variables take precedence over file values.
+// Also loads .env file from current directory if exists.
 func LoadAndApply() error {
+	// First, try to load .env file from current directory
+	if err := loadDotEnv(".env"); err == nil {
+		// .env loaded successfully
+	}
+	
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return nil // non-fatal
@@ -175,4 +181,34 @@ func toString(v any) string {
 	default:
 		return fmt.Sprint(v)
 	}
+}
+
+// loadDotEnv loads environment variables from a .env file
+func loadDotEnv(filename string) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Parse KEY=VALUE
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		// Only set if not already set (env vars take precedence)
+		if os.Getenv(key) == "" {
+			os.Setenv(key, value)
+		}
+	}
+	return scanner.Err()
 }
