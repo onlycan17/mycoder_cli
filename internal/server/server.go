@@ -83,25 +83,34 @@ type API struct {
 }
 
 func NewAPI(s Store, p llm.ChatProvider) *API {
+	lg := mylog.New()
 	a := &API{store: s, llm: p}
 	if e, ok := any(p).(llm.Embedder); ok {
 		a.emb = e
+		lg.Info("embeddings.provider", "status", "found")
+	} else {
+		lg.Info("embeddings.provider", "status", "not_found")
 	}
 	a.vs = vectorstore.NewFromEnv()
 	if a.emb != nil && os.Getenv("MYCODER_EMBED_CACHE_DISABLE") != "1" {
 		a.emb = newCachingEmbedder(a.emb)
+		lg.Info("embeddings.cache", "status", "enabled")
 	}
 	// embedding availability check and env opt-out
 	if os.Getenv("MYCODER_DISABLE_EMBEDDINGS") == "1" {
+		lg.Info("embeddings.disabled", "reason", "env_var_set")
 		a.emb = nil
 	} else if a.emb != nil {
-		// quick health check: tiny embedding with short timeout
-		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		// quick health check: tiny embedding with reasonable timeout for remote servers
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		if _, err := a.emb.Embeddings(ctx, os.Getenv("MYCODER_EMBEDDING_MODEL"), []string{"ping"}); err != nil {
-			lg := mylog.New()
-			lg.Warn("embeddings.disabled", "reason", err.Error())
+		embModel := os.Getenv("MYCODER_EMBEDDING_MODEL")
+		lg.Info("embeddings.health_check", "model", embModel)
+		if _, err := a.emb.Embeddings(ctx, embModel, []string{"ping"}); err != nil {
+			lg.Warn("embeddings.disabled", "reason", err.Error(), "model", embModel)
 			a.emb = nil
+		} else {
+			lg.Info("embeddings.enabled", "model", embModel)
 		}
 	}
 	return a

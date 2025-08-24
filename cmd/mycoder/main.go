@@ -1852,6 +1852,7 @@ func interactiveChatMode() {
 		fmt.Println("📚 Indexing project files for better analysis...")
 		go indexProjectInBackground(serverURL, projectID)
 		// Don't wait for indexing to complete, let it run in background
+		time.Sleep(100 * time.Millisecond) // Brief pause to let indexing start
 		fmt.Println("✅ Indexing started in background")
 	} else {
 		fmt.Println("✅ Project index is up to date")
@@ -1920,8 +1921,9 @@ func isServerRunning(serverURL string) bool {
 func startServerInBackground() {
 	// Start server in background using exec.Command for proper process management
 	cmd := exec.Command(os.Args[0], "serve", "--addr", ":8089")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// Redirect server output to /dev/null to avoid cluttering the UI
+	cmd.Stdout = nil
+	cmd.Stderr = nil
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start server: %v\n", err)
 	}
@@ -1958,11 +1960,16 @@ func getOrCreateDefaultProject(serverURL string) string {
 		}
 	}
 
-	// Create default project
+	// Create default project with mycoder_cli directory
+	projectRoot := "/Users/ojinseog/myprojects/mycoder_cli"
+	// Check if we're already in mycoder_cli directory
 	currentDir, _ := os.Getwd()
+	if strings.Contains(currentDir, "mycoder_cli") {
+		projectRoot = currentDir
+	}
 	projectData := map[string]string{
-		"name":     "default",
-		"rootPath": currentDir,
+		"name":     "mycoder_cli",
+		"rootPath": projectRoot,
 	}
 	jsonData, _ := json.Marshal(projectData)
 
@@ -2188,14 +2195,10 @@ func monitorIndexingJob(serverURL, jobID string) {
 		
 		if status, ok := job["status"].(string); ok {
 			if status == "completed" {
-				if stats, ok := job["stats"].(map[string]interface{}); ok {
-					if indexed, ok := stats["indexed"].(float64); ok {
-						fmt.Printf("\n✅ Indexing completed: %d files indexed\n💬 > ", int(indexed))
-					}
-				}
+				// Silently complete - don't interrupt user's input
 				return
 			} else if status == "failed" {
-				fmt.Printf("\n⚠️  Indexing failed\n💬 > ")
+				// Silently fail - don't interrupt user's input
 				return
 			}
 		}

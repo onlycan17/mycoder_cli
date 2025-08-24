@@ -8,7 +8,13 @@
       "Bash(pkill:*)",
       "Read(//private/tmp/**)",
       "Bash(./bin/mycoder:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(grep:*)",
+      "Bash(go build:*)",
+      "Read(//private/tmp/**)",
+      "Read(//private/tmp/**)"
     ],
     "deny": [],
     "ask": []
