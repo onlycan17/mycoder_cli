@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"mycoder/internal/config"
 	mylog "mycoder/internal/log"
@@ -24,8 +25,9 @@ func main() {
 	// load config file and apply env (env has precedence)
 	_ = config.LoadAndApply()
 	if len(os.Args) < 2 {
-		usage()
-		os.Exit(1)
+		// No arguments provided - start interactive chat mode
+		interactiveChatMode()
+		return
 	}
 
 	switch os.Args[1] {
@@ -94,6 +96,7 @@ func main() {
 func usage() {
 	fmt.Println("mycoder - project-aware coding CLI")
 	fmt.Println("usage:")
+	fmt.Println("  mycoder                           - Interactive chat mode (like Claude Code)")
 	fmt.Println("  mycoder serve [--addr :8089]")
 	fmt.Println("  mycoder version")
 	fmt.Println("  mycoder projects [list|create]")
@@ -1814,5 +1817,261 @@ func mcpCmd(args []string) {
 	default:
 		fmt.Println("usage: mycoder mcp tools|call --name <tool> --json '<params>'")
 		os.Exit(1)
+	}
+}
+
+// interactiveChatMode starts an interactive chat session similar to Claude Code or Gemini CLI
+func interactiveChatMode() {
+	fmt.Println("🚀 mycoder interactive chat mode")
+	fmt.Println("Type your questions or commands. Use '/help' for help, '/exit' to quit.")
+	fmt.Println("────────────────────────────────────────────────────────────────")
+
+	// Check if server is running
+	serverURL := getServerURL()
+	if !isServerRunning(serverURL) {
+		fmt.Printf("⚠️  Server not running. Starting server at %s...\n", serverURL)
+		go startServerInBackground()
+		// Wait a bit for server to start
+		fmt.Println("⏳ Waiting for server to start...")
+		waitForServerReady(serverURL, 10)
+	}
+
+	// Get or create default project
+	projectID := getOrCreateDefaultProject(serverURL)
+	if projectID == "" {
+		fmt.Println("❌ Failed to create/find default project")
+		return
+	}
+
+	fmt.Printf("📁 Using project: %s\n", projectID)
+	fmt.Println("────────────────────────────────────────────────────────────────")
+
+	scanner := bufio.NewScanner(os.Stdin)
+
+	for {
+		fmt.Print("💬 > ")
+		if !scanner.Scan() {
+			break
+		}
+
+		input := strings.TrimSpace(scanner.Text())
+		if input == "" {
+			continue
+		}
+
+		// Handle special commands
+		switch {
+		case input == "/exit" || input == "/quit" || input == "/q":
+			fmt.Println("👋 Goodbye!")
+			return
+		case input == "/help" || input == "/h":
+			printInteractiveHelp()
+			continue
+		case input == "/clear":
+			clearScreen()
+			continue
+		case strings.HasPrefix(input, "/project"):
+			handleProjectCommand(input, serverURL)
+			continue
+		case strings.HasPrefix(input, "/index"):
+			handleIndexCommand(input, projectID, serverURL)
+			continue
+		}
+
+		// Send chat request
+		fmt.Println("🤖 Thinking...")
+		response := sendChatRequest(serverURL, projectID, input)
+		fmt.Println("────────────────────────────────────────────────────────────────")
+		fmt.Println(response)
+		fmt.Println("────────────────────────────────────────────────────────────────")
+	}
+}
+
+func getServerURL() string {
+	if url := os.Getenv("MYCODER_SERVER_URL"); url != "" {
+		return url
+	}
+	return "http://localhost:8089"
+}
+
+func isServerRunning(serverURL string) bool {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(serverURL + "/healthz")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == 200
+}
+
+func startServerInBackground() {
+	// Start server in background
+	// This is a simple approach - in production you might want more sophisticated process management
+	if err := server.Run(":8089"); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to start server: %v\n", err)
+	}
+}
+
+func waitForServerReady(serverURL string, maxSeconds int) {
+	for i := 0; i < maxSeconds; i++ {
+		if isServerRunning(serverURL) {
+			fmt.Println("✅ Server is ready!")
+			return
+		}
+		fmt.Print(".")
+		time.Sleep(1 * time.Second)
+	}
+	fmt.Println("\n⚠️  Server might not be ready, but continuing...")
+}
+
+func getOrCreateDefaultProject(serverURL string) string {
+	// Try to list projects first
+	client := &http.Client{}
+	resp, err := client.Get(serverURL + "/projects")
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		var projects []map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&projects)
+		if len(projects) > 0 {
+			if id, ok := projects[0]["id"].(string); ok {
+				return id
+			}
+		}
+	}
+
+	// Create default project
+	projectData := map[string]string{
+		"name": "default",
+		"root": ".",
+	}
+	jsonData, _ := json.Marshal(projectData)
+
+	resp2, err := client.Post(serverURL+"/projects", "application/json", strings.NewReader(string(jsonData)))
+	if err != nil {
+		return ""
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode == 201 {
+		var result map[string]interface{}
+		json.NewDecoder(resp2.Body).Decode(&result)
+		if id, ok := result["id"].(string); ok {
+			return id
+		}
+	}
+
+	return ""
+}
+
+func sendChatRequest(serverURL, projectID, message string) string {
+	client := &http.Client{}
+
+	requestBody := map[string]interface{}{
+		"messages": []map[string]string{
+			{"role": "user", "content": message},
+		},
+		"stream":    false, // Use non-streaming for simplicity in interactive mode
+		"projectID": projectID,
+		"retrieval": map[string]int{"k": 5},
+	}
+
+	jsonData, _ := json.Marshal(requestBody)
+	resp, err := client.Post(serverURL+"/chat", "application/json", strings.NewReader(string(jsonData)))
+	if err != nil {
+		return fmt.Sprintf("❌ Error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Sprintf("❌ Server error: %s", resp.Status)
+	}
+
+	var response map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return fmt.Sprintf("❌ Failed to parse response: %v", err)
+	}
+
+	if content, ok := response["content"].(string); ok {
+		return content
+	}
+
+	return "❌ No response content"
+}
+
+func printInteractiveHelp() {
+	fmt.Println("🔧 Interactive Chat Commands:")
+	fmt.Println("  /help, /h          - Show this help")
+	fmt.Println("  /exit, /quit, /q   - Exit interactive mode")
+	fmt.Println("  /clear             - Clear screen")
+	fmt.Println("  /project list      - List projects")
+	fmt.Println("  /project <name>    - Switch to project")
+	fmt.Println("  /index             - Index current project")
+	fmt.Println("  <your question>    - Ask anything about the code")
+	fmt.Println()
+	fmt.Println("💡 Examples:")
+	fmt.Println("  > What is this project about?")
+	fmt.Println("  > How does the server.go file work?")
+	fmt.Println("  > Show me the REST API endpoints")
+	fmt.Println("  > Help me add a new feature")
+}
+
+func clearScreen() {
+	// Simple clear screen for Unix-like systems
+	fmt.Print("\033[2J\033[H")
+}
+
+func handleProjectCommand(input, serverURL string) {
+	parts := strings.Split(input, " ")
+	if len(parts) < 2 {
+		fmt.Println("Usage: /project list|<name>")
+		return
+	}
+
+	if parts[1] == "list" {
+		client := &http.Client{}
+		resp, err := client.Get(serverURL + "/projects")
+		if err != nil {
+			fmt.Printf("❌ Error: %v\n", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		var projects []map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&projects)
+
+		fmt.Println("📁 Available projects:")
+		for _, p := range projects {
+			fmt.Printf("  - %s (ID: %s)\n", p["name"], p["id"])
+		}
+	} else {
+		fmt.Printf("🔄 Project switching to '%s' not implemented yet\n", parts[1])
+	}
+}
+
+func handleIndexCommand(input, projectID, serverURL string) {
+	fmt.Printf("🔄 Indexing project %s...\n", projectID)
+
+	client := &http.Client{}
+	requestBody := map[string]interface{}{
+		"projectID": projectID,
+		"mode":      "full",
+	}
+
+	jsonData, _ := json.Marshal(requestBody)
+	resp, err := client.Post(serverURL+"/index/run", "application/json", strings.NewReader(string(jsonData)))
+	if err != nil {
+		fmt.Printf("❌ Error: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		fmt.Println("✅ Indexing started successfully")
+	} else {
+		fmt.Printf("❌ Indexing failed: %s\n", resp.Status)
 	}
 }
