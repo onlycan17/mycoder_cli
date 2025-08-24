@@ -1944,9 +1944,10 @@ func getOrCreateDefaultProject(serverURL string) string {
 	}
 
 	// Create default project
+	currentDir, _ := os.Getwd()
 	projectData := map[string]string{
-		"name": "default",
-		"root": ".",
+		"name":     "default",
+		"rootPath": currentDir,
 	}
 	jsonData, _ := json.Marshal(projectData)
 
@@ -1956,9 +1957,13 @@ func getOrCreateDefaultProject(serverURL string) string {
 	}
 	defer resp2.Body.Close()
 
-	if resp2.StatusCode == 201 {
+	if resp2.StatusCode == 200 || resp2.StatusCode == 201 {
 		var result map[string]interface{}
 		json.NewDecoder(resp2.Body).Decode(&result)
+		if id, ok := result["projectID"].(string); ok {
+			return id
+		}
+		// Fallback to "id" field for compatibility
 		if id, ok := result["id"].(string); ok {
 			return id
 		}
