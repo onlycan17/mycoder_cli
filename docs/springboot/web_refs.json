@@ -1,0 +1,7 @@
+[
+  {"title":"Spring Boot Reference","url":"https://docs.spring.io/spring-boot/docs/current/reference/html/","score":0.9},
+  {"title":"Spring Guides","url":"https://spring.io/guides","score":0.85},
+  {"title":"Spring Boot Actuator","url":"https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html","score":0.8},
+  {"title":"Spring Data JPA","url":"https://docs.spring.io/spring-data/jpa/docs/current/reference/html/","score":0.8},
+  {"title":"Baeldung Spring","url":"https://www.baeldung.com/","score":0.7}
+]

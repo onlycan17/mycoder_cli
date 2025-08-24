@@ -74,6 +74,8 @@ func main() {
 		fsCmd(os.Args[2:])
 	case "mcp":
 		mcpCmd(os.Args[2:])
+	case "seed":
+		seedCmd(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 
@@ -111,6 +113,7 @@ func usage() {
 	fmt.Println("  mycoder edit --project <id> --goal \"<설명>\" [--files a.go,b.go] [--stream]")
 	fmt.Println("  mycoder mcp tools|call --name <tool> --json '<params>'")
 	fmt.Println("  mycoder test --project <id> [--timeout 60] [--verbose]")
+	fmt.Println("  mycoder seed rag --project <id> [--docs] [--code] [--web-json <file>] [--dry-run] [--pin]")
 	fmt.Println("  mycoder <command> (coming soon): edit | hooks | fs | exec | mcp")
 }
 
@@ -760,6 +763,108 @@ func parseEnvCSV(csv string) map[string]string {
 		}
 	}
 	return m
+}
+
+// seedCmd implements: mycoder seed rag --project <id> [--docs] [--code] [--web-json <file>] [--dry-run] [--pin]
+func seedCmd(args []string) {
+	if len(args) == 0 || args[0] != "rag" {
+		fmt.Println("usage: mycoder seed rag --project <id> [--docs] [--code] [--web-json <file>] [--dry-run] [--pin]")
+		os.Exit(1)
+	}
+	fs := flag.NewFlagSet("seed rag", flag.ExitOnError)
+	project := fs.String("project", "", "project ID")
+	includeDocs := fs.Bool("docs", true, "seed internal docs")
+	includeCode := fs.Bool("code", true, "seed code summaries")
+	webJSON := fs.String("web-json", "", "path to JSON file for web references (optional)")
+	dry := fs.Bool("dry-run", false, "print actions but do not POST")
+	pin := fs.Bool("pin", true, "pin knowledge items when applicable")
+	_ = fs.Parse(args[1:])
+	if *project == "" {
+		fmt.Println("--project required")
+		os.Exit(1)
+	}
+
+	// internal docs seeds (title -> csv files)
+	docSeeds := []struct{ title, files string }{
+		{"PRD", "docs/PRD.md"},
+		{"Architecture", "docs/ARCHITECTURE.md"},
+		{"API", "docs/API.md"},
+		{"Data Model", "docs/DATA_MODEL.md"},
+		{"RAG", "docs/RAG.md,docs/MEMORY.md"},
+		{"LLM", "docs/LLM.md"},
+		{"CLI/Tools", "docs/CLI_UX.md,docs/TOOLS.md"},
+		{"Testing/CI", "docs/TESTING_CI.md"},
+		{"Roadmap", "docs/ROADMAP.md"},
+	}
+	// code summary seeds
+	codeSeeds := []struct{ title, files string }{
+		{"Server Overview", "internal/server/server.go"},
+		{"Indexer", "internal/indexer/indexer.go"},
+		{"Retriever", "internal/rag/retriever/knn.go,internal/rag/retriever/bm25.go,internal/rag/retriever/hybrid.go"},
+		{"Patch Utilities", "internal/patch/unified.go,internal/patch/apply.go"},
+		{"CLI Entrypoint", "cmd/mycoder/main.go"},
+	}
+
+	// run promote-auto for each seed
+	runPromote := func(title, files string) error {
+		body := fmt.Sprintf(`{"projectID":"%s","title":"%s","files":[%s],"pin":%v}`,
+			*project, title, toJSONStringArray(files), *pin)
+		if *dry {
+			fmt.Printf("[dry-run] promote-auto: %s <- [%s]\n", title, files)
+			return nil
+		}
+		resp, err := http.Post(serverURL()+"/knowledge/promote/auto", "application/json", strings.NewReader(body))
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+		if resp.StatusCode/100 != 2 {
+			return fmt.Errorf("promote-auto failed: %s", resp.Status)
+		}
+		fmt.Printf("seeded: %s\n", title)
+		return nil
+	}
+
+	if *includeDocs {
+		for _, s := range docSeeds {
+			if err := runPromote(s.title, s.files); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+			}
+		}
+	}
+	if *includeCode {
+		for _, s := range codeSeeds {
+			if err := runPromote(s.title, s.files); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+			}
+		}
+	}
+
+	// optional web ingest
+	if strings.TrimSpace(*webJSON) != "" {
+		b, err := os.ReadFile(*webJSON)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		// ensure projectID presence; if not present, wrap
+		payload := string(b)
+		if !strings.Contains(payload, "\"projectID\"") {
+			payload = fmt.Sprintf(`{"projectID":"%s","results":%s,"dedupe":true}`, *project, strings.TrimSpace(string(b)))
+		}
+		if *dry {
+			fmt.Printf("[dry-run] web ingest from %s\n", *webJSON)
+			return
+		}
+		resp, err := http.Post(serverURL()+"/web/ingest", "application/json", strings.NewReader(payload))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		io.Copy(os.Stdout, resp.Body)
+	}
 }
 
 func tailLines(s string, n int) string {

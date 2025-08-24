@@ -29,6 +29,16 @@ build:
 	@echo "[build] building mycoder"
 	@go build -o bin/mycoder ./cmd/mycoder
 
+# Seed RAG knowledge using the CLI.
+# Usage: make seed-rag PROJECT=<project-id> [WEB=path/to/web.json] [DRY=1]
+seed-rag: build
+	@if [ -z "$(PROJECT)" ]; then echo "PROJECT is required (project ID)"; exit 1; fi
+	@echo "[seed] docs+code seeds to project $(PROJECT)"
+	@BIN="bin/mycoder"; \
+	if [ "$(DRY)" = "1" ]; then DRYFLAG="--dry-run"; else DRYFLAG=""; fi; \
+	$$BIN seed rag --project $(PROJECT) --docs --code $$DRYFLAG; \
+	if [ -n "$(WEB)" ]; then echo "[seed] web ingest from $(WEB)"; $$BIN seed rag --project $(PROJECT) --docs=false --code=false --web-json $(WEB) $$DRYFLAG; fi
+
 install: build
 	@echo "[install] installing mycoder to $(BINDIR)"
 	@mkdir -p $(BINDIR)
@@ -87,3 +97,20 @@ hook-install:
 	@mkdir -p .git/hooks
 	@install -m 0755 scripts/pre-commit.sh .git/hooks/pre-commit
 	@echo "[hooks] installed .git/hooks/pre-commit"
+
+# Seed Spring Boot docs and optional web references
+# Usage: make seed-spring PROJECT=<project-id> [DRY=1]
+seed-spring: build
+	@if [ -z "$(PROJECT)" ]; then echo "PROJECT is required (project ID)"; exit 1; fi
+	@BIN="bin/mycoder"; \
+	if [ "$(DRY)" = "1" ]; then DRYFLAG="--dry-run"; else DRYFLAG=""; fi; \
+	$$BIN knowledge promote-auto --project $(PROJECT) --title "Spring Boot Overview" --files docs/springboot/OVERVIEW.md $$DRYFLAG --pin; \
+	$$BIN knowledge promote-auto --project $(PROJECT) --title "Spring Annotations" --files docs/springboot/ANNOTATIONS.md $$DRYFLAG --pin; \
+	$$BIN knowledge promote-auto --project $(PROJECT) --title "REST Patterns" --files docs/springboot/REST.md $$DRYFLAG --pin; \
+	$$BIN knowledge promote-auto --project $(PROJECT) --title "Spring Data JPA" --files docs/springboot/DATA_JPA.md $$DRYFLAG --pin; \
+	$$BIN knowledge promote-auto --project $(PROJECT) --title "Spring Config" --files docs/springboot/CONFIG.md $$DRYFLAG --pin; \
+	$$BIN knowledge promote-auto --project $(PROJECT) --title "Spring Testing" --files docs/springboot/TESTING.md $$DRYFLAG --pin; \
+	$$BIN knowledge promote-auto --project $(PROJECT) --title "Spring Security" --files docs/springboot/SECURITY.md $$DRYFLAG --pin; \
+	$$BIN knowledge promote-auto --project $(PROJECT) --title "Actuator" --files docs/springboot/ACTUATOR.md $$DRYFLAG --pin; \
+	$$BIN knowledge promote-auto --project $(PROJECT) --title "Spring Build/Run" --files docs/springboot/BUILD.md $$DRYFLAG --pin; \
+	$$BIN seed rag --project $(PROJECT) --docs=false --code=false --web-json docs/springboot/web_refs.json $$DRYFLAG
