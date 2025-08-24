@@ -46,8 +46,11 @@ func Index(root string, opt Options) ([]FileDoc, error) {
 	}
 
 	// Prefer git-aware listing (respects .gitignore), fallback to WalkDir
+	// When Include patterns are provided or override env is set, force WalkDir to allow
+	// users to explicitly include files even if .gitignore would exclude them.
 	files := make([]string, 0, opt.MaxFiles)
-	if useGitListing(root) {
+	forceWalk := len(opt.Include) > 0 || os.Getenv("MYCODER_INDEX_FORCE_WALK") == "1"
+	if !forceWalk && useGitListing(root) {
 		if lst, err := gitListFiles(root); err == nil && len(lst) > 0 {
 			files = lst
 		}

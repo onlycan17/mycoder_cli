@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -1845,7 +1846,7 @@ func interactiveChatMode() {
 	}
 
 	fmt.Printf("📁 Using project: %s\n", projectID)
-	
+
 	// Auto-index the project if needed
 	fmt.Println("🔍 Checking project index status...")
 	if shouldIndexProject(serverURL, projectID) {
@@ -1857,7 +1858,7 @@ func interactiveChatMode() {
 	} else {
 		fmt.Println("✅ Project index is up to date")
 	}
-	
+
 	fmt.Println("────────────────────────────────────────────────────────────────")
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -1942,55 +1943,42 @@ func waitForServerReady(serverURL string, maxSeconds int) {
 }
 
 func getOrCreateDefaultProject(serverURL string) string {
-	// Try to list projects first
 	client := &http.Client{}
-	resp, err := client.Get(serverURL + "/projects")
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		var projects []map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&projects)
-		if len(projects) > 0 {
-			if id, ok := projects[0]["id"].(string); ok {
-				return id
+	cwd, _ := os.Getwd()
+	// 1) Try to find existing project with rootPath == cwd
+	if resp, err := client.Get(serverURL + "/projects"); err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode == 200 {
+			var projects []map[string]interface{}
+			_ = json.NewDecoder(resp.Body).Decode(&projects)
+			for _, p := range projects {
+				if rp, ok := p["rootPath"].(string); ok && rp == cwd {
+					if id, ok := p["id"].(string); ok && id != "" {
+						return id
+					}
+				}
 			}
 		}
 	}
-
-	// Create default project with mycoder_cli directory
-	projectRoot := "/Users/ojinseog/myprojects/mycoder_cli"
-	// Check if we're already in mycoder_cli directory
-	currentDir, _ := os.Getwd()
-	if strings.Contains(currentDir, "mycoder_cli") {
-		projectRoot = currentDir
-	}
-	projectData := map[string]string{
-		"name":     "mycoder_cli",
-		"rootPath": projectRoot,
-	}
-	jsonData, _ := json.Marshal(projectData)
-
-	resp2, err := client.Post(serverURL+"/projects", "application/json", strings.NewReader(string(jsonData)))
+	// 2) Create a project for the current working directory
+	name := filepath.Base(cwd)
+	body := map[string]string{"name": name, "rootPath": cwd}
+	jb, _ := json.Marshal(body)
+	resp2, err := client.Post(serverURL+"/projects", "application/json", strings.NewReader(string(jb)))
 	if err != nil {
 		return ""
 	}
 	defer resp2.Body.Close()
-
 	if resp2.StatusCode == 200 || resp2.StatusCode == 201 {
 		var result map[string]interface{}
-		json.NewDecoder(resp2.Body).Decode(&result)
-		if id, ok := result["projectID"].(string); ok {
+		_ = json.NewDecoder(resp2.Body).Decode(&result)
+		if id, ok := result["projectID"].(string); ok && id != "" {
 			return id
 		}
-		// Fallback to "id" field for compatibility
-		if id, ok := result["id"].(string); ok {
+		if id, ok := result["id"].(string); ok && id != "" {
 			return id
 		}
 	}
-
 	return ""
 }
 
@@ -2075,6 +2063,14 @@ func handleProjectCommand(input, serverURL string) {
 		for _, p := range projects {
 			fmt.Printf("  - %s (ID: %s)\n", p["name"], p["id"])
 		}
+	} else if parts[1] == "here" {
+		// Create or switch to project for current working directory
+		id := getOrCreateDefaultProject(serverURL)
+		if id == "" {
+			fmt.Println("❌ Failed to create/switch to current directory project")
+			return
+		}
+		fmt.Printf("✅ Using project for current dir: %s\n", id)
 	} else {
 		fmt.Printf("🔄 Project switching to '%s' not implemented yet\n", parts[1])
 	}
@@ -2108,29 +2104,29 @@ func handleIndexCommand(input, projectID, serverURL string) {
 func shouldIndexProject(serverURL, projectID string) bool {
 	// Check if project has been indexed before
 	client := &http.Client{Timeout: 2 * time.Second}
-	
+
 	// Try to search for a test query to see if index exists
 	testQuery := "main"
 	url := fmt.Sprintf("%s/search?q=%s&projectID=%s", serverURL, testQuery, projectID)
-	
+
 	resp, err := client.Get(url)
 	if err != nil {
 		// If error, assume needs indexing
 		return true
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != 200 {
 		// If not successful, needs indexing
 		return true
 	}
-	
+
 	// Check if we have any results
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return true
 	}
-	
+
 	// If results exist, check if they're empty
 	if results, ok := result["results"].([]interface{}); ok {
 		if len(results) == 0 {
@@ -2140,7 +2136,7 @@ func shouldIndexProject(serverURL, projectID string) bool {
 		// Has indexed documents, check age (for now, skip if already indexed)
 		return false
 	}
-	
+
 	// Default to indexing if uncertain
 	return true
 }
@@ -2151,7 +2147,7 @@ func indexProjectInBackground(serverURL, projectID string) {
 	requestBody := map[string]interface{}{
 		"projectID": projectID,
 		"mode":      "full",
-		"maxFiles":  1000,  // Limit for initial indexing
+		"maxFiles":  1000, // Limit for initial indexing
 	}
 
 	jsonData, _ := json.Marshal(requestBody)
@@ -2177,22 +2173,22 @@ func indexProjectInBackground(serverURL, projectID string) {
 func monitorIndexingJob(serverURL, jobID string) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	maxAttempts := 30 // Monitor for max 30 seconds
-	
+
 	for i := 0; i < maxAttempts; i++ {
 		time.Sleep(1 * time.Second)
-		
+
 		resp, err := client.Get(fmt.Sprintf("%s/index/jobs/%s", serverURL, jobID))
 		if err != nil {
 			continue
 		}
-		
+
 		var job map[string]interface{}
 		if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
 			resp.Body.Close()
 			continue
 		}
 		resp.Body.Close()
-		
+
 		if status, ok := job["status"].(string); ok {
 			if status == "completed" {
 				// Silently complete - don't interrupt user's input

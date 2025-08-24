@@ -30,6 +30,7 @@ import (
 	mylog "mycoder/internal/log"
 	"mycoder/internal/models"
 	"mycoder/internal/rag/planner"
+	"mycoder/internal/rag/retriever"
 	"mycoder/internal/store"
 	"mycoder/internal/vectorstore"
 	"mycoder/internal/version"
@@ -91,7 +92,12 @@ func NewAPI(s Store, p llm.ChatProvider) *API {
 	} else {
 		lg.Info("embeddings.provider", "status", "not_found")
 	}
-	a.vs = vectorstore.NewFromEnv()
+	// Prefer SQLite-backed VectorStore when available; fallback to env provider.
+	if ss, ok := s.(*store.SQLiteStore); ok {
+		a.vs = vectorstore.NewSQLite(ss.DB())
+	} else {
+		a.vs = vectorstore.NewFromEnv()
+	}
 	if a.emb != nil && os.Getenv("MYCODER_EMBED_CACHE_DISABLE") != "1" {
 		a.emb = newCachingEmbedder(a.emb)
 		lg.Info("embeddings.cache", "status", "enabled")
@@ -621,16 +627,30 @@ func (a *API) handleIndexRun(w http.ResponseWriter, r *http.Request) {
 			}
 			docs, _ := indexer.Index(p.RootPath, opt)
 			// incremental if supported
+			var pipe *embedpipe.Pipeline
+			if a.emb != nil && a.vs != nil {
+				pipe = embedpipe.New(a.emb, a.vs)
+			}
 			if inc, ok := a.store.(IncrementalStore); ok {
 				present := make([]string, 0, len(docs))
 				for _, d := range docs {
-					inc.UpsertDocument(p.ID, d.Path, d.Content, d.SHA, d.Lang, d.MTime)
+					doc := inc.UpsertDocument(p.ID, d.Path, d.Content, d.SHA, d.Lang, d.MTime)
+					if pipe != nil {
+						pipe.Add(p.ID, doc.ID, d.Path, d.SHA, d.Content)
+					}
 					present = append(present, d.Path)
 				}
 				_ = inc.PruneDocuments(p.ID, present)
+				if pipe != nil {
+					_ = pipe.Flush(context.Background())
+				}
 			} else {
 				for _, d := range docs {
 					a.store.AddDocument(p.ID, d.Path, d.Content)
+					if pipe != nil {
+						pipe.Add(p.ID, "", d.Path, d.SHA, d.Content)
+						_ = pipe.Flush(context.Background())
+					}
 				}
 			}
 			stats := map[string]int{"documents": len(docs)}
@@ -2518,6 +2538,16 @@ func (a *API) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	// optional: summarize conversation if too long (map-reduce style pre-summary)
 	msgs = a.maybeSummarize(msgs, req.ProjectID)
+	// debug: log first message role/size if enabled
+	if os.Getenv("MYCODER_RAG_DEBUG") == "1" {
+		role := "(none)"
+		size := 0
+		if len(msgs) > 0 {
+			role = string(msgs[0].Role)
+			size = len(msgs[0].Content)
+		}
+		fmt.Fprintf(os.Stderr, "[rag-debug] messages=%d first_role=%s first_size=%d\n", len(msgs), role, size)
+	}
 	// metrics: count chat requests
 	metrics.mu.Lock()
 	metrics.chatRequests++
@@ -2657,7 +2687,29 @@ func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []
 	// adjust retrieval K based on intent
 	intent := planner.Classify(q)
 	k = planner.RetrievalK(intent, k)
-	raw := a.store.Search(projectID, q, k*2)
+	// Use hybrid retrieval (BM25 + KNN) when embeddings available; fallback to lexical only.
+	var raw []models.SearchResult
+	if a.emb != nil && a.vs != nil {
+		// build hybrid
+		lex := retriever.NewBM25(a.store)
+		knn := retriever.NewKNN(a.vs, a.emb)
+		hyb := retriever.NewHybrid(lex, knn)
+		// retrieval timeout configurable via env; default 5s
+		rt := 5 * time.Second
+		if v := os.Getenv("MYCODER_RETRIEVAL_TIMEOUT_MS"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				rt = time.Duration(n) * time.Millisecond
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), rt)
+		defer cancel()
+		if res, err := hyb.Retrieve(ctx, projectID, q, k*2); err == nil {
+			raw = res
+		}
+	}
+	if len(raw) == 0 {
+		raw = a.store.Search(projectID, q, k*2)
+	}
 	if len(raw) == 0 {
 		return messages
 	}
@@ -2730,6 +2782,17 @@ func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []
 		}
 		if len(hits) >= k {
 			break
+		}
+	}
+	if os.Getenv("MYCODER_RAG_DEBUG") == "1" {
+		// log selected paths for context
+		fmt.Fprintf(os.Stderr, "[rag-debug] hits=%d\n", len(hits))
+		max := hits
+		if len(max) > 5 {
+			max = hits[:5]
+		}
+		for _, h := range max {
+			fmt.Fprintf(os.Stderr, "[rag-debug] hit %s:%d-%d\n", h.Path, h.StartLine, h.EndLine)
 		}
 	}
 	// prepend curated knowledge heads (titles/links) if exists
@@ -2815,7 +2878,24 @@ func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []
 			break
 		}
 	}
-	sys := llm.Message{Role: llm.RoleSystem, Content: b.String()}
+	ctxText := b.String()
+	// Strategy: default inject as system. Optional: prepend to last user when env set.
+	if os.Getenv("MYCODER_RAG_INJECT_STRATEGY") == "append_user" {
+		out := make([]llm.Message, 0, len(messages))
+		out = append(out, messages...)
+		// find last user message
+		for i := len(out) - 1; i >= 0; i-- {
+			if out[i].Role == llm.RoleUser {
+				out[i].Content = ctxText + "\n\n" + out[i].Content
+				if os.Getenv("MYCODER_RAG_DEBUG") == "1" {
+					fmt.Fprintf(os.Stderr, "[rag-debug] injected into last user message, added=%d bytes\n", len(ctxText))
+				}
+				break
+			}
+		}
+		return out
+	}
+	sys := llm.Message{Role: llm.RoleSystem, Content: ctxText}
 	out := make([]llm.Message, 0, len(messages)+1)
 	out = append(out, sys)
 	out = append(out, messages...)

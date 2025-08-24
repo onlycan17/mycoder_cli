@@ -29,11 +29,13 @@ func (h *HybridRetriever) Retrieve(ctx context.Context, projectID string, query 
 	// fetch from both (sequential; can be parallelized later)
 	lex, err := h.lexical.Retrieve(ctx, projectID, query, k)
 	if err != nil {
-		return nil, err
+		// degrade gracefully when lexical fails
+		lex = nil
 	}
 	knn, err := h.knn.Retrieve(ctx, projectID, query, k)
 	if err != nil {
-		return nil, err
+		// degrade gracefully when knn fails (e.g., embed timeout)
+		knn = nil
 	}
 	// merge by path with weighted score
 	type agg struct {

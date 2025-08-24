@@ -40,7 +40,7 @@ func LoadAndApply() error {
 	if err := loadDotEnv(".env"); err == nil {
 		// .env loaded successfully
 	}
-	
+
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return nil // non-fatal
@@ -190,7 +190,7 @@ func loadDotEnv(filename string) error {
 		return err
 	}
 	defer file.Close()
-	
+
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
