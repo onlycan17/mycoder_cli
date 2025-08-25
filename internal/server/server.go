@@ -3042,7 +3042,10 @@ func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []
 					maxLines = minLines
 				}
 			}
-			code := readSnippet(root, h.Path, h.StartLine, h.EndLine, maxLines)
+			// neighbor expansion to function/class boundaries if enabled
+			s, e := h.StartLine, h.EndLine
+			s, e = expandSnippetRange(root, h.Path, s, e)
+			code := readSnippet(root, h.Path, s, e, maxLines)
 			if code != "" {
 				block := fmt.Sprintf("```%s\n%s\n```\n", fenceLangFor(h.Path), code)
 				if len(block) > budget {
@@ -3148,6 +3151,79 @@ func fenceLangFor(path string) string {
 		return "yaml"
 	default:
 		return ""
+	}
+}
+
+// expandSnippetRange attempts to expand [start,end] to function/class boundaries.
+// Controlled by env:
+// - MYCODER_RAG_NEIGHBOR_ENABLE=1 to enable
+// - MYCODER_RAG_NEIGHBOR_MAX_LINES: max lines to scan on each side (default 80)
+func expandSnippetRange(root, rel string, start, end int) (int, int) {
+	if os.Getenv("MYCODER_RAG_NEIGHBOR_ENABLE") != "1" {
+		return start, end
+	}
+	maxScan := 80
+	if v := os.Getenv("MYCODER_RAG_NEIGHBOR_MAX_LINES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxScan = n
+		}
+	}
+	full := filepath.Clean(filepath.Join(root, rel))
+	data, err := os.ReadFile(full)
+	if err != nil {
+		return start, end
+	}
+	lines := strings.Split(string(data), "\n")
+	if start <= 0 {
+		start = 1
+	}
+	if end <= 0 || end > len(lines) {
+		end = start
+	}
+	re := boundaryRegexForPath(rel)
+	if re == nil {
+		return start, end
+	}
+	// expand up
+	s := start
+	for i, scanned := s-1, 0; i >= 1 && scanned < maxScan; i, scanned = i-1, scanned+1 {
+		if re.MatchString(lines[i-1]) {
+			s = i
+			break
+		}
+	}
+	// expand down: find next boundary after end, stop before it
+	e := end
+	for i, scanned := e+1, 0; i <= len(lines) && scanned < maxScan; i, scanned = i+1, scanned+1 {
+		if re.MatchString(lines[i-1]) {
+			// previous line ends the block
+			e = i - 1
+			break
+		}
+		// if reached file end within scan window
+		if i == len(lines) {
+			e = len(lines)
+			break
+		}
+	}
+	if e < s {
+		e = s
+	}
+	return s, e
+}
+
+// boundaryRegexForPath returns a regex matching language boundaries by extension.
+func boundaryRegexForPath(path string) *regexp.Regexp {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".go":
+		return regexp.MustCompile(`^(func|type|const|var)\b`)
+	case ".ts", ".tsx", ".js", ".jsx":
+		return regexp.MustCompile(`^(export\s+)?(async\s+)?(function|class)\b`)
+	case ".py":
+		return regexp.MustCompile(`^(def|class)\b`)
+	default:
+		return nil
 	}
 }
 
