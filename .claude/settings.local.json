@@ -44,7 +44,10 @@
       "Bash(MYCODER_RAG_INJECT_STRATEGY=append_user )",
       "Bash(FORCE_RESTART=1 )",
       "Bash(REINDEX=0 )",
-      "Bash(FORCE_RESTART=1 REINDEX=0 bash scripts/bootstrap_rag.sh)"
+      "Bash(FORCE_RESTART=1 REINDEX=0 bash scripts/bootstrap_rag.sh)",
+      "Bash(go install:*)",
+      "Bash(go env:*)",
+      "Read(//Users/ojinseog_ai/go/bin/**)"
     ],
     "deny": [],
     "ask": []

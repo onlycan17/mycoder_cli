@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -1985,13 +1986,21 @@ func getOrCreateDefaultProject(serverURL string) string {
 func sendChatRequest(serverURL, projectID, message string) string {
 	client := &http.Client{Timeout: 30 * time.Second}
 
+	// base retrieval K can be tuned by env; default to a richer value
+	k := 8
+	if v := os.Getenv("MYCODER_DEFAULT_RETRIEVAL_K"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			k = n
+		}
+	}
+
 	requestBody := map[string]interface{}{
 		"messages": []map[string]string{
 			{"role": "user", "content": message},
 		},
 		"stream":    false, // Use non-streaming for simplicity in interactive mode
 		"projectID": projectID,
-		"retrieval": map[string]int{"k": 5},
+		"retrieval": map[string]int{"k": k},
 	}
 
 	jsonData, _ := json.Marshal(requestBody)

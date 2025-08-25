@@ -443,7 +443,7 @@ func Run(addr string) error {
 
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           logMiddleware(mux),
+		Handler:           logMiddleware(rateLimitMiddleware(mux)),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -506,6 +506,156 @@ func newRequestID() string {
 	return string(out)
 }
 
+// clientIP extracts the best-effort client IP from headers or RemoteAddr.
+func clientIP(r *http.Request) string {
+	// X-Forwarded-For may contain a comma-separated list; take the first
+	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+		if idx := strings.IndexByte(xff, ','); idx >= 0 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return xff
+	}
+	if rip := strings.TrimSpace(r.Header.Get("X-Real-IP")); rip != "" {
+		return rip
+	}
+	host := r.RemoteAddr
+	if i := strings.LastIndexByte(host, ':'); i > 0 {
+		return host[:i]
+	}
+	return host
+}
+
+// rateLimiter provides simple token-bucket rate limiting by key.
+type rateLimiter struct {
+	mu      sync.Mutex
+	rps     float64
+	buckets map[string]*bucket
+}
+
+type bucket struct {
+	tokens float64
+	last   time.Time
+}
+
+func newRateLimiter(rps float64) *rateLimiter {
+	return &rateLimiter{rps: rps, buckets: make(map[string]*bucket)}
+}
+
+// allow reports whether a request with key is allowed now and, if not, the seconds until next token.
+func (rl *rateLimiter) allow(key string) (bool, int) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if rl.rps <= 0 {
+		return true, 0
+	}
+	b := rl.buckets[key]
+	now := time.Now()
+	if b == nil {
+		b = &bucket{tokens: rl.rps, last: now}
+		rl.buckets[key] = b
+	}
+	// refill tokens
+	elapsed := now.Sub(b.last).Seconds()
+	b.tokens = minFloat(b.tokens+elapsed*rl.rps, rl.rps)
+	b.last = now
+	if b.tokens >= 1 {
+		b.tokens -= 1
+		return true, 0
+	}
+	// compute wait time for next whole token
+	need := 1 - b.tokens
+	wait := int(need/rl.rps + 0.999) // ceil to whole seconds
+	if wait < 1 {
+		wait = 1
+	}
+	return false, wait
+}
+
+func minFloat(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// rateLimitMiddleware enforces basic RPS limits across global, path, and client scopes.
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	// read env once on first use
+	var once sync.Once
+	var gLimiter, pLimiter, iLimiter *rateLimiter
+	init := func() {
+		// fallbacks to MYCODER_RATE_LIMIT_RPS when specific not set
+		base := parseFloatEnv("MYCODER_RATE_LIMIT_RPS")
+		g := parseFloatEnv("MYCODER_RATE_LIMIT_GLOBAL_RPS")
+		p := parseFloatEnv("MYCODER_RATE_LIMIT_PATH_RPS")
+		i := parseFloatEnv("MYCODER_RATE_LIMIT_IP_RPS")
+		if g == -1 {
+			g = base
+		}
+		if p == -1 {
+			p = base
+		}
+		if i == -1 {
+			i = base
+		}
+		gLimiter = newRateLimiter(g)
+		pLimiter = newRateLimiter(p)
+		iLimiter = newRateLimiter(i)
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		once.Do(init)
+		if (gLimiter == nil || gLimiter.rps <= 0) && (pLimiter == nil || pLimiter.rps <= 0) && (iLimiter == nil || iLimiter.rps <= 0) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// build keys for three scopes
+		globalKey := "global"
+		pathKey := "path:" + normalizePath(r.URL.Path)
+		ipKey := "ip:" + clientIP(r)
+
+		// deny if any scope exceeds
+		if gLimiter != nil && gLimiter.rps > 0 {
+			if ok, _ := gLimiter.allow(globalKey); !ok {
+				_, wait := gLimiter.allow(globalKey)
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", wait))
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte("rate limit exceeded"))
+				return
+			}
+		}
+		if pLimiter != nil && pLimiter.rps > 0 {
+			if ok, _ := pLimiter.allow(pathKey); !ok {
+				_, wait := pLimiter.allow(pathKey)
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", wait))
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte("rate limit exceeded"))
+				return
+			}
+		}
+		if iLimiter != nil && iLimiter.rps > 0 {
+			if ok, _ := iLimiter.allow(ipKey); !ok {
+				_, wait := iLimiter.allow(ipKey)
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", wait))
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte("rate limit exceeded"))
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func parseFloatEnv(key string) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return -1
+	}
+	if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+		return f
+	}
+	return -1
+}
+
 func logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -523,6 +673,9 @@ func logMiddleware(next http.Handler) http.Handler {
 			"req_id", reqID,
 			"method", r.Method,
 			"path", r.URL.Path,
+			"userAgent", r.UserAgent(),
+			"referer", r.Referer(),
+			"remoteIP", clientIP(r),
 			"status", rec.status,
 			"duration_ms", int(dur/time.Millisecond),
 			"bytes", rec.nbytes,
@@ -2711,6 +2864,14 @@ func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []
 		raw = a.store.Search(projectID, q, k*2)
 	}
 	if len(raw) == 0 {
+		// No hits: inject a concise project overview to orient the model
+		if ov := a.projectOverview(projectID, 2000); strings.TrimSpace(ov) != "" {
+			sys := llm.Message{Role: llm.RoleSystem, Content: ov}
+			out := make([]llm.Message, 0, len(messages)+1)
+			out = append(out, sys)
+			out = append(out, messages...)
+			return out
+		}
 		return messages
 	}
 	// trustScore-aware rerank: adjust search score with knowledge trust per path
@@ -2816,10 +2977,15 @@ func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []
 		messages = append([]llm.Message{sys}, messages...)
 	}
 	var b strings.Builder
-	b.WriteString("You are a coding assistant. Use the following repo context and cite files with line ranges. If not enough evidence, say you are unsure.\n\n")
+	b.WriteString(ragInstruction(q))
 	b.WriteString("Context:\n")
 	// approximate token budget in bytes (dynamic line count per snippet)
 	budget := 3000
+	if v := os.Getenv("MYCODER_RAG_BUDGET_BYTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			budget = n
+		}
+	}
 	avgLineBytes := 80 // heuristic; used to size maxLines per snippet
 	var root string
 	if p, ok := a.store.GetProject(projectID); ok {
@@ -2951,6 +3117,209 @@ func fenceLangFor(path string) string {
 	default:
 		return ""
 	}
+}
+
+// ragInstruction returns a style-aware instruction for LLM behavior.
+// Controlled via env MYCODER_RAG_STYLE: "detailed" (default) or "concise".
+func ragInstruction(userQ string) string {
+	style := strings.ToLower(strings.TrimSpace(os.Getenv("MYCODER_RAG_STYLE")))
+	if style == "concise" {
+		return "You are a coding assistant. Use the following repo context and cite files with line ranges. Keep answers focused and accurate.\n\n"
+	}
+	// Try to respond in Korean when the user query contains Hangul
+	langHint := ""
+	if containsHangul(userQ) {
+		langHint = " 답변은 한국어로 작성하세요."
+	}
+	return "You are a meticulous coding assistant. Provide a thorough, structured answer using the repo context and cite files with line ranges. Include reasoning, key files, related modules, pitfalls, and concrete next steps." + langHint + "\n\n"
+}
+
+func containsHangul(s string) bool {
+	for _, r := range s {
+		if (r >= 0x1100 && r <= 0x11FF) || (r >= 0x3130 && r <= 0x318F) || (r >= 0xAC00 && r <= 0xD7A3) {
+			return true
+		}
+	}
+	return false
+}
+
+// projectOverview builds a brief, bounded summary of the project structure and key files.
+// maxBytes limits the returned string size to avoid over-injecting context.
+func (a *API) projectOverview(projectID string, maxBytes int) string {
+	p, ok := a.store.GetProject(projectID)
+	if !ok || p.RootPath == "" {
+		return ""
+	}
+	// Index a subset of files to summarize.
+	docs, err := indexer.Index(p.RootPath, indexer.Options{MaxFiles: 300, MaxFileSize: 128 * 1024})
+	if err != nil || len(docs) == 0 {
+		return ""
+	}
+	// Language counts
+	langCount := make(map[string]int)
+	// Collect top-level dirs/files and a shallow tree (depth <= 2)
+	type node struct {
+		name  string
+		isDir bool
+	}
+	top := make(map[string][]node) // dir -> children
+	rootChildren := make(map[string]bool)
+	keyFiles := map[string]bool{"README.md": false, "go.mod": false, "package.json": false, "pyproject.toml": false}
+	for _, d := range docs {
+		if d.Lang != "" {
+			langCount[d.Lang]++
+		}
+		parts := strings.Split(d.Path, "/")
+		if len(parts) == 1 {
+			rootChildren[parts[0]] = true
+			if _, ok := keyFiles[parts[0]]; ok {
+				keyFiles[parts[0]] = true
+			}
+			continue
+		}
+		// depth 2 tree
+		parent := parts[0]
+		child := parts[1]
+		lst := top[parent]
+		// avoid duplicates, only record first-level children
+		seen := false
+		for _, n := range lst {
+			if n.name == child {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			// best effort dir/file guess based on extension
+			isDir := len(parts) > 2 || filepath.Ext(child) == ""
+			top[parent] = append(lst, node{name: child, isDir: isDir})
+		}
+	}
+	// Build overview text
+	var b strings.Builder
+	b.WriteString("Project Overview (auto):\n")
+	b.WriteString("- Root: ")
+	b.WriteString(filepath.Base(p.RootPath))
+	b.WriteString("\n")
+	// Languages summary
+	if len(langCount) > 0 {
+		b.WriteString("- Languages: ")
+		// order by count desc
+		type kv struct {
+			k string
+			v int
+		}
+		arr := make([]kv, 0, len(langCount))
+		for k, v := range langCount {
+			arr = append(arr, kv{k, v})
+		}
+		sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
+		max := len(arr)
+		if max > 6 {
+			max = 6
+		}
+		for i := 0; i < max; i++ {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(arr[i].k)
+			b.WriteString(": ")
+			b.WriteString(strconv.Itoa(arr[i].v))
+		}
+		b.WriteString("\n")
+	}
+	// Key files presence
+	var keys []string
+	for k, ok := range keyFiles {
+		if ok {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	if len(keys) > 0 {
+		b.WriteString("- Key files: ")
+		b.WriteString(strings.Join(keys, ", "))
+		b.WriteString("\n")
+	}
+	// Shallow tree
+	b.WriteString("- Structure (depth 2):\n")
+	// root children list
+	rnames := make([]string, 0, len(rootChildren)+len(top))
+	for k := range rootChildren {
+		rnames = append(rnames, k)
+	}
+	for k := range top {
+		rnames = append(rnames, k)
+	}
+	// dedupe
+	uniq := make(map[string]bool)
+	out := make([]string, 0, len(rnames))
+	for _, n := range rnames {
+		if !uniq[n] {
+			uniq[n] = true
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	capRoot := 10
+	if len(out) < capRoot {
+		capRoot = len(out)
+	}
+	for i := 0; i < capRoot; i++ {
+		name := out[i]
+		b.WriteString("  • ")
+		b.WriteString(name)
+		b.WriteString("\n")
+		children := top[name]
+		if len(children) == 0 {
+			continue
+		}
+		sort.Slice(children, func(i, j int) bool { return children[i].name < children[j].name })
+		max := len(children)
+		if max > 6 {
+			max = 6
+		}
+		for j := 0; j < max; j++ {
+			b.WriteString("    - ")
+			b.WriteString(children[j].name)
+			if children[j].isDir {
+				b.WriteString("/")
+			}
+			b.WriteString("\n")
+		}
+	}
+	// Append short extracts from README/package/go.mod if present
+	addSnippet := func(rel string, maxLines int) {
+		full := filepath.Join(p.RootPath, rel)
+		data, err := os.ReadFile(full)
+		if err != nil {
+			return
+		}
+		lines := strings.Split(string(data), "\n")
+		if len(lines) > maxLines {
+			lines = lines[:maxLines]
+		}
+		txt := strings.TrimSpace(strings.Join(lines, "\n"))
+		if txt == "" {
+			return
+		}
+		b.WriteString("\n")
+		b.WriteString(rel)
+		b.WriteString(":\n")
+		// fence as markdown; LLMs handle plain too
+		b.WriteString("" + txt + "\n")
+	}
+	for _, rel := range []string{"README.md", "package.json", "go.mod"} {
+		addSnippet(rel, 40)
+		if b.Len() >= maxBytes {
+			break
+		}
+	}
+	outStr := b.String()
+	if maxBytes > 0 && len(outStr) > maxBytes {
+		return outStr[:maxBytes]
+	}
+	return outStr
 }
 
 type cachingEmbedder struct {

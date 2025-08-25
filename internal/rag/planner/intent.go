@@ -16,8 +16,8 @@ const (
 )
 
 var (
-	reNav      = regexp.MustCompile(`(?i)where\s+is|find\s+(?:file|symbol)|navigate|go\s+to`)
-	reExplain  = regexp.MustCompile(`(?i)explain|what\s+does|요약|설명`)
+	reNav      = regexp.MustCompile(`(?i)where\s+is|find\s+(?:file|symbol)|navigate|go\s+to|구조`) // 구조: navigating/structure
+	reExplain  = regexp.MustCompile(`(?i)explain|what\s+does|요약|설명|분석`)                          // 분석: explanation/analysis
 	reEdit     = regexp.MustCompile(`(?i)edit|refactor|rename|change|modify|fix|추가|수정|변경`)
 	reResearch = regexp.MustCompile(`(?i)compare|alternatives|research|pros\s+and\s+cons|장단점|조사`)
 )

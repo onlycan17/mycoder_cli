@@ -288,7 +288,7 @@ $ mycoder chat --project $PID "요약해줘: internal/server/server.go 변경 �
 - 예시(YAML, 평면 키:값):
   ```yaml
   MYCODER_SERVER_URL: http://localhost:8089
-  MYCODER_OPENAI_BASE_URL: http://localhost:1234/v1
+  MYCODER_OPENAI_BASE_URL: http://localhost:3620/v1
   MYCODER_OPENAI_API_KEY: ""
   MYCODER_CHAT_MODEL: gpt-3.5-turbo
   MYCODER_EMBEDDING_MODEL: text-embedding-3-small

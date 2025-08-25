@@ -9,6 +9,8 @@
 - HTTP 데몬: REST 엔드포인트(`/chat`, `/edits/*`, `/index/*`, `/search`, `/knowledge`, `/projects`, `/tools/hooks`).
 - 인덱서: Git 인지 파일 워커, 언어 감지, 언어별 청커, 심볼 추출, 증분 인덱싱.
 - RAG: 리트리버(BM25+벡터), 리랭커, 쿼리 플래너(탐색/설명/편집/리서치), 인용자.
+  - 다국어/폴백: 한글 질의 직접 검색 → 임계치 미달 시 KO→EN 번역 후 재검색(옵션, env로 토글).
+  - 모델 스코프: VectorStore 검색은 `project_id + dim + model` 범위로 제한해 혼류 방지.
 - 저장소: Document/Chunk/Embedding/TermIndex/Run/Symbol/Project 테이블, 외부 벡터 인덱스.
 - LLM 게이트웨이: 공급자 추상화(OpenAI-호환 로컬/LM Studio 중심), 스트리밍, 재시도/속도제한.
 - 도구 실행기: 포맷/린트/테스트 훅, 패치 적용/롤백, 웹 검색 수집, 파일시스템/터미널 실행, MCP 클라이언트.
@@ -30,6 +32,10 @@
 - 개발/로컬 기본: SQLite + FTS5(레키시컬) + 선택적 sqlite-vec(가능 시). 벡터 미사용 모드에서도 하이브리드 degrade 허용.
 - 프로덕션 권장: PostgreSQL 15+ + pgvector 0.6+ (HNSW 인덱스). 설정 권장값: cosine, m=16, ef_construction=128, ef_search=40, lists는 데이터 크기에 맞게 튜닝. 임베딩 차원: 1536(OpenAI text-embedding-3-small) 기본.
 - 대안: Qdrant(로컬/도커) 1.8+ HNSW. 운영팀 성향/인프라에 따라 선택.
+
+### 임베딩/번역 설정(제안)
+- `MYCODER_EMBEDDING_PROVIDER`/`MYCODER_EMBEDDING_MODEL`로 코드 전용 임베딩 교체.
+- `MYCODER_TRANSLATE_KO_EN`/`MYCODER_TRANSLATOR_MODEL`로 번역 폴백 경로 활성화.
 
 ## 4. 안정성/회복력
 - 컨텍스트 타임아웃, 취소 전파, 재시도(지터), 서킷브레이커.

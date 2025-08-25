@@ -567,83 +567,47 @@ type chunk struct {
 
 // chunkTextWithLines splits text and tracks line ranges for each chunk.
 func chunkTextWithLines(s string, maxLen int) []chunk {
-	if maxLen <= 0 {
-		maxLen = 2000
-	}
 	if len(s) == 0 {
 		return nil
 	}
-	// Precompute line breaks
-	// We’ll count lines as we segment
-	start := 0
-	currentLine := 1
-	var out []chunk
-	for start < len(s) {
-		end := start + maxLen
-		if end >= len(s) {
-			end = len(s)
-		}
-		cut := end
-		for i := end; i > start && i > end-200; i-- {
-			if s[i-1] == '\n' {
-				cut = i
-				break
-			}
-		}
-		if cut == start {
-			cut = end
-		}
-		piece := s[start:cut]
-		lines := 1
-		for i := 0; i < len(piece); i++ {
-			if piece[i] == '\n' {
-				lines++
-			}
-		}
-		c := chunk{Text: piece, StartLine: currentLine, EndLine: currentLine + lines - 1}
-		out = append(out, c)
-		currentLine += lines - 1
-		start = cut
-	}
-	return out
+	maxTok, overlap := chunkConfig(maxLen)
+	return splitTokensWithOverlap(s, maxTok, overlap, 1)
 }
 
 // chunkSmartWithLines prefers code boundaries when possible based on language.
 func chunkSmartWithLines(s, lang string, maxLen int) []chunk {
-	if maxLen <= 0 {
-		maxLen = 2000
-	}
 	if len(s) == 0 {
 		return nil
 	}
 	re := boundaryRegex(lang)
 	lines := strings.Split(s, "\n")
-	var out []chunk
+	var pieces []chunk
 	var buf strings.Builder
 	startLine := 1
+	// Collect code-aware pieces first
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
-		// cut at boundary when current chunk is reasonably sized
-		if re != nil && re.MatchString(line) && buf.Len() >= maxLen/2 {
+		if re != nil && re.MatchString(line) && buf.Len() >= 1_000 { // approx boundary size
 			text := buf.String()
 			if text != "" {
-				out = append(out, chunk{Text: text, StartLine: startLine, EndLine: startLine + strings.Count(text, "\n")})
+				pieces = append(pieces, chunk{Text: text, StartLine: startLine, EndLine: startLine + strings.Count(text, "\n")})
 				startLine += strings.Count(text, "\n")
 				buf.Reset()
 			}
-		}
-		if buf.Len()+len(line)+1 > maxLen && buf.Len() > 0 {
-			text := buf.String()
-			out = append(out, chunk{Text: text, StartLine: startLine, EndLine: startLine + strings.Count(text, "\n")})
-			startLine += strings.Count(text, "\n")
-			buf.Reset()
 		}
 		buf.WriteString(line)
 		buf.WriteByte('\n')
 	}
 	if buf.Len() > 0 {
 		text := buf.String()
-		out = append(out, chunk{Text: text, StartLine: startLine, EndLine: startLine + strings.Count(text, "\n")})
+		pieces = append(pieces, chunk{Text: text, StartLine: startLine, EndLine: startLine + strings.Count(text, "\n")})
+	}
+	// Now apply token windows with overlap per piece
+	maxTok, overlap := chunkConfig(maxLen)
+	var out []chunk
+	for _, p := range pieces {
+		subs := splitTokensWithOverlap(p.Text, maxTok, overlap, p.StartLine)
+		out = append(out, subs...)
 	}
 	return out
 }
@@ -664,14 +628,11 @@ func boundaryRegex(lang string) *regexp.Regexp {
 // chunkDocWithLines splits markdown/text into chunks by headings and paragraph
 // boundaries while respecting a soft maxLen. Headings always start a new chunk.
 func chunkDocWithLines(s string, maxLen int) []chunk {
-	if maxLen <= 0 {
-		maxLen = 2000
-	}
 	if len(s) == 0 {
 		return nil
 	}
 	lines := strings.Split(s, "\n")
-	var out []chunk
+	var pieces []chunk
 	var buf strings.Builder
 	startLine := 1
 	flush := func() {
@@ -679,36 +640,178 @@ func chunkDocWithLines(s string, maxLen int) []chunk {
 			return
 		}
 		text := buf.String()
-		out = append(out, chunk{Text: text, StartLine: startLine, EndLine: startLine + strings.Count(text, "\n")})
+		pieces = append(pieces, chunk{Text: text, StartLine: startLine, EndLine: startLine + strings.Count(text, "\n")})
 		startLine += strings.Count(text, "\n")
 		buf.Reset()
 	}
 	isHeading := func(l string) bool {
 		ltrim := strings.TrimSpace(l)
-		if strings.HasPrefix(ltrim, "#") {
-			return true
-		}
-		return false
+		return strings.HasPrefix(ltrim, "#")
 	}
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
 		if isHeading(line) {
-			// start new chunk at heading
-			flush()
-		}
-		// if buffer too large, flush at paragraph boundary
-		if buf.Len()+len(line)+1 > maxLen && buf.Len() > 0 {
 			flush()
 		}
 		buf.WriteString(line)
 		buf.WriteByte('\n')
-		// optional paragraph break
-		if strings.TrimSpace(line) == "" && buf.Len() >= maxLen/2 {
+		if strings.TrimSpace(line) == "" && buf.Len() >= 1000 {
 			flush()
 		}
 	}
 	flush()
+	// apply token windows per piece
+	maxTok, overlap := chunkConfig(maxLen)
+	var out []chunk
+	for _, p := range pieces {
+		subs := splitTokensWithOverlap(p.Text, maxTok, overlap, p.StartLine)
+		out = append(out, subs...)
+	}
 	return out
+}
+
+// --- token-based chunking with overlap ---
+type tokenPos struct{ start, end int }
+
+func scanTokens(s string) []tokenPos {
+	var toks []tokenPos
+	n := len(s)
+	i := 0
+	for i < n {
+		// skip whitespace
+		for i < n {
+			c := s[i]
+			if c == ' ' || c == '\n' || c == '\t' || c == '\r' {
+				i++
+				continue
+			}
+			break
+		}
+		if i >= n {
+			break
+		}
+		st := i
+		for i < n {
+			c := s[i]
+			if c == ' ' || c == '\n' || c == '\t' || c == '\r' {
+				break
+			}
+			i++
+		}
+		toks = append(toks, tokenPos{start: st, end: i})
+	}
+	return toks
+}
+
+func splitTokensWithOverlap(s string, maxTokens int, overlapRatio float64, startLine int) []chunk {
+	if maxTokens <= 0 {
+		maxTokens = 400
+	}
+	if overlapRatio < 0 {
+		overlapRatio = 0
+	}
+	if overlapRatio > 0.5 {
+		overlapRatio = 0.5
+	}
+	toks := scanTokens(s)
+	if len(toks) == 0 {
+		return nil
+	}
+	step := maxTokens - int(float64(maxTokens)*overlapRatio+0.5)
+	if step < 1 {
+		step = 1
+	}
+	var out []chunk
+	// prefix newline counts for fast line offsets
+	// compute lines up to any byte index by scanning prefix each time (acceptable for tests scale)
+	for i := 0; i < len(toks); i += step {
+		j := i + maxTokens
+		if j > len(toks) {
+			j = len(toks)
+		}
+		st := toks[i].start
+		en := toks[j-1].end
+		piece := s[st:en]
+		// compute line offsets
+		prefix := s[:st]
+		start := startLine + strings.Count(prefix, "\n")
+		end := start + strings.Count(piece, "\n")
+		out = append(out, chunk{Text: piece, StartLine: start, EndLine: end})
+		if j == len(toks) {
+			break
+		}
+	}
+	return out
+}
+
+func chunkConfig(hint int) (maxTokens int, overlap float64) {
+	// env override
+	if v := os.Getenv("MYCODER_CHUNK_MAX_TOKENS"); v != "" {
+		if n := atoiNoErr(v); n > 0 {
+			maxTokens = n
+		}
+	}
+	if maxTokens == 0 {
+		if hint > 0 {
+			maxTokens = hint / 5
+		} // rough mapping from old char limit
+		if maxTokens <= 0 {
+			maxTokens = 400
+		}
+	}
+	overlap = 0.10
+	if v := os.Getenv("MYCODER_CHUNK_OVERLAP_RATIO"); v != "" {
+		if f := atofNoErr(v); f >= 0 && f <= 0.5 {
+			overlap = f
+		}
+	}
+	return
+}
+
+func atoiNoErr(s string) int {
+	n := 0
+	sign := 1
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if i == 0 && (c == '-' || c == '+') {
+			if c == '-' {
+				sign = -1
+			}
+			continue
+		}
+		if c < '0' || c > '9' {
+			break
+		}
+		n = n*10 + int(c-'0')
+	}
+	return sign * n
+}
+
+func atofNoErr(s string) float64 {
+	// very small parser: int or decimal like 0.15
+	whole, frac := 0, 0
+	fdiv := 1
+	sign := 1
+	i := 0
+	if i < len(s) && (s[i] == '-' || s[i] == '+') {
+		if s[i] == '-' {
+			sign = -1
+		}
+		i++
+	}
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		whole = whole*10 + int(s[i]-'0')
+		i++
+	}
+	if i < len(s) && s[i] == '.' {
+		i++
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			frac = frac*10 + int(s[i]-'0')
+			fdiv *= 10
+			i++
+		}
+	}
+	return float64(sign) * (float64(whole) + float64(frac)/float64(fdiv))
 }
 
 func (s *SQLiteStore) Stats() map[string]int {

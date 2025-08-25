@@ -25,6 +25,11 @@ func NewHybrid(lex Retriever, knn Retriever) *HybridRetriever {
 	return &HybridRetriever{lexical: lex, knn: knn, alpha: a}
 }
 
+// NewHybridWithAlpha creates a HybridRetriever with an explicit alpha.
+func NewHybridWithAlpha(lex Retriever, knn Retriever, alpha float64) *HybridRetriever {
+	return &HybridRetriever{lexical: lex, knn: knn, alpha: alpha}
+}
+
 func (h *HybridRetriever) Retrieve(ctx context.Context, projectID string, query string, k int) ([]Result, error) {
 	// fetch from both (sequential; can be parallelized later)
 	lex, err := h.lexical.Retrieve(ctx, projectID, query, k)

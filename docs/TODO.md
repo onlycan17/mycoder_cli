@@ -1,11 +1,24 @@
 # TODO (대분류/중분류/소분류)
 
 ## 현재 작업
- - [ ] 요청 ID 전파(X-Request-ID): 미들웨어로 수신/생성, 응답 헤더 반영, 구조화 로그 필드(`req_id`) 추가, 단위 테스트 및 문서화
+ - [x] 요청 ID 전파(X-Request-ID): 미들웨어로 수신/생성, 응답 헤더 반영, 구조화 로그 필드(`req_id`) 추가, 단위 테스트 및 문서화
  - [x] 프로메테우스 스타일 `/metrics` 텍스트 포맷 지표 노출(옵션)
+ - [x] RAG 다국어/코드 임베딩 전략 초기 적용(문서/설정/임계치 설계)
+ - [ ] Qwen3 Coder 30B 최적화: 프롬프트 지시 강화(근거/한국어/모름), 컨텍스트 예산 상향 검토
 
 ## 다음 단계
-- [ ] 서버 안정성: 간단 RPS 레이트 리미팅(전역/경로/아이피 기준, `MYCODER_RATE_LIMIT_RPS`), 429/Retry-After 처리 및 테스트
+- [ ] VectorStore 검색 스코프에 `model` 필터 추가(혼류 방지)
+- [x] embedpipe Upsert 시 Provider/Model 라벨 환경변수화(하드코딩 제거)
+- [x] 번역 폴백 경로(한국어→영어) 추가: env 플래그/타임아웃/테스트 포함
+- [x] 청킹을 토큰 기준 + 10~15% 오버랩으로 전환(코드 경계 우선)
+- [x] 하이브리드 가중치 α 재튜닝 및 리더보드 구성(k@5/10, MRR)
+  - 테스트: `internal/rag/retriever/leaderboard_test.go` (α grid 평가 및 최고 α 선택)
+- [ ] 컨텍스트 예산/라인 스니펫 길이 튜닝(모델 컨텍스트 윈도우 확인 후 적용)
+- [ ] pgvector(Qdrant 대안) ANN 백엔드 실장 및 선택적 마이그레이션
+- [ ] 이웃 확장(함수/클래스 경계 기반) 적용
+- [ ] (선택) 크로스엔코더/LLM 재랭킹 상위 M 도입
+- [x] 서버 안정성: 간단 RPS 레이트 리미팅(전역/경로/아이피 기준, `MYCODER_RATE_LIMIT_RPS`), 429/Retry-After 처리 및 테스트
+  - 세분화 설정 추가: `MYCODER_RATE_LIMIT_GLOBAL_RPS`, `MYCODER_RATE_LIMIT_PATH_RPS`, `MYCODER_RATE_LIMIT_IP_RPS` (미설정 시 `MYCODER_RATE_LIMIT_RPS` 폴백)
 - [ ] API 문서 보강: `/fs/patch/unified`, `/fs/patch/unified/rollback`, `/fs/diff` 명세 추가 및 예시 요청/응답
 - [ ] 요청 추적성: 요청 로그에 `userAgent`, `referer`, `remoteIP` 필드 추가 및 마스킹 규칙 검토
 - [ ] 보안/토큰: `MYCODER_API_TOKEN` 스코프 분리(예: `projects:read`, `fs:write`)와 엔드포인트별 체크(옵션)
@@ -90,6 +103,11 @@
 - 중분류: 품질 개선
   - [x] 경로 중복 제거 및 상위 K 유니크 샘플링
   - [x] 코드 블록 예산 자동 조절/중복 제거 강화
+  - [ ] 다국어/번역 폴백 루틴(KO→EN→검색→KO) 설계/구현/테스트
+  - [ ] 모델 스코프 필터(`project_id+dim+model`) 적용 및 회귀 테스트
+  - [ ] 토큰 기반 청킹+오버랩 구현 및 회귀 테스트
+  - [ ] CodeXEmbed(코드 전용 임베딩) 공급자 어댑터 추가 및 헬스체크/배치 설정화
+  - [ ] 하이브리드 α 재튜닝/신뢰도 가중 조정(실험/측정 포함)
 ## 대분류: 검색 품질/맥락
 - 중분류: 라인 정보/프리뷰
   - [x] 청크 메타 라인 범위 저장 및 응답 startLine/endLine 제공
@@ -110,6 +128,7 @@
   - [x] LM Studio 통합 스모크 테스트(옵트인)
   - [x] 임베딩 로컬 모델 지원 여부 확인 및 폴백 정책
   - [x] OpenAI(옵션) 베이스URL/키 전환 가이드 문서화
+  - [ ] Qwen3 Coder 30B 고정 모델 설정 문서화 및 프롬프트 템플릿 조정
  - 중분류: 안정성
   - [x] 최소 간격(MYCODER_LLM_MIN_INTERVAL_MS) 및 429/5xx 재시도 백오프
 - 중분류: 스트리밍/SSE

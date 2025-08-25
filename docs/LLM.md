@@ -14,10 +14,18 @@
 - 인증: 보통 불필요(빈 키) — 필요 시 `MYCODER_OPENAI_API_KEY`에 더미값 허용
 
 #### 설정(환경변수)
-- `MYCODER_OPENAI_BASE_URL=http://192.168.0.227:3620/v1`
-- `MYCODER_OPENAI_API_KEY=` (빈값 허용)
-- `MYCODER_EMBEDDING_MODEL=text-embedding-3-small` (로컬 임베딩 제공 시 해당 이름 사용)
-- `MYCODER_CHAT_MODEL=gpt-3.5-turbo` (LM Studio에 로드된 모델 식별자로 대체)
+- 공통
+  - `MYCODER_OPENAI_BASE_URL=http://192.168.0.227:3620/v1`
+  - `MYCODER_OPENAI_API_KEY=` (빈값 허용)
+- 채팅 모델(고정 정책)
+  - `MYCODER_CHAT_MODEL=qwen3-coder-30b-a3b-instruct`
+- 임베딩(권장)
+  - 코드 전용 임베딩 사용 시: `MYCODER_EMBEDDING_PROVIDER=codexembed`, `MYCODER_EMBEDDING_MODEL=<codexembed-model-id>`
+  - 일반 텍스트 임베딩: `MYCODER_EMBEDDING_MODEL=text-embedding-3-small`
+- 번역 폴백(옵션)
+  - `MYCODER_TRANSLATE_KO_EN=1`
+  - `MYCODER_TRANSLATOR_MODEL=<translator-model-id>`
+  - `MYCODER_TRANSLATE_TIMEOUT_MS=2500`
 
 #### 제약/권고
 - 토큰화/컨텍스트 윈도우가 모델별로 상이 — 청크/프롬프트 토큰 예산을 모델별로 조정.
@@ -48,7 +56,13 @@
 - 레이트 리미트: 토큰/요청 기반 슬라이딩 윈도우
 - 로깅: 요청 메타(모델/토큰/소요)만, 프롬프트/응답 전문은 옵트인 마스킹
  - 최소 간격: `MYCODER_LLM_MIN_INTERVAL_MS`(클라이언트 측 요청 간 최소 간격, ms)
- - 임베딩 폴백: 임베딩 모델/엔드포인트가 없거나 오류 시 서버가 자동으로 임베딩을 비활성화(레키시컬만 사용). 강제 비활성화: `MYCODER_DISABLE_EMBEDDINGS=1`.
+- 임베딩 폴백: 임베딩 모델/엔드포인트가 없거나 오류 시 서버가 자동으로 임베딩을 비활성화(레키시컬만 사용). 강제 비활성화: `MYCODER_DISABLE_EMBEDDINGS=1`.
+
+### Qwen 계열 모델 최적화 가이드(요약)
+- 프롬프트 스타일: 근거 우선, 인용 강제(`path:start-end`), 불확실 시 "모름". 한국어 답변을 기본으로 지시.
+- 컨텍스트 예산: 모델 컨텍스트 윈도우에 맞춰 동적으로 조정(초기값은 RAG 컴포저의 바이트 예산 사용, 모델 스펙 확인 후 상향 가능).
+- 다국어 질의: 기본은 한글 질의 직접 검색, 부족 시 KO→EN 번역 후 재검색 루틴 활성화.
+- 임베딩: 코드 전용 임베딩 + 모델 스코프 분리(동일 차원 타 모델 혼류 방지). 차원 변경 시 재색인.
 
 ### 지원 엔드포인트(호환)
 - `GET /v1/models`

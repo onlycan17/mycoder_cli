@@ -40,6 +40,11 @@
 - 프로덕션 권장: PostgreSQL 15+ + pgvector 0.6+ (HNSW). cosine, m=16, ef_construction=128, ef_search=40, lists는 데이터 크기별 튜닝. 임베딩 차원 1536.
 - 대안: Qdrant 1.8+ (도커), HNSW 파라미터는 유사 수준으로 설정.
 
+### 검색 스코프(모델 분리)
+- 동일 차원의 서로 다른 임베딩 모델이 혼합되면 검색 품질이 저하될 수 있음.
+- 검색 시 스코프를 `project_id + dim + model`로 제한하는 것을 권장(로컬 SQLite 구현부터 적용 가능).
+- 저장 필드: `embeddings(provider, model, dim)`를 사용하여 모델 단위로 색인을 분리.
+
 ## 무결성/정책
 - Document.sha/etag로 변경 감지 → 증분 인덱싱.
 - WebSource TTL 만료 시 재수집.
