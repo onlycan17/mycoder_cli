@@ -35,3 +35,12 @@
 - 런타임 가중치: `MYCODER_HYBRID_ALPHA`(기본 0.5)
 - 자동 평가: `go test ./internal/rag/retriever -run TestHybridAlphaLeaderboard -v` 실행 시 α grid(예: 0.0, 0.5, 1.0)에 대해 k@5/k@10/MRR 로깅
 - 용어(k@K: 상위 K개 내 정답 포함 비율, MRR: 최초 정답 순위의 역수 평균)
+
+스니펫/컨텍스트 예산 튜닝
+- `MYCODER_RAG_BUDGET_BYTES`: 컨텍스트 전체 바이트 예산(기본 3000)
+- `MYCODER_RAG_AVG_LINE_BYTES`: 평균 라인 바이트 추정치(기본 80)
+- `MYCODER_RAG_MIN_LINES_PER_SNIPPET`: 각 스니펫 최소 라인(기본 6)
+- `MYCODER_RAG_MAX_LINES_CAP`: 각 스니펫 상한 라인(기본 24)
+- `MYCODER_RAG_SNIPPET_MARGIN_LINES`: 스니펫 앞뒤 여유 라인(기본 2)
+- `MYCODER_PREVIEW_SNIPPET_TOKENS`: FTS 미리보기 토큰 윈도우(기본 10)
+- `MYCODER_KP_BUDGET_BYTES` / `MYCODER_KP_FILE_BYTES`: 자동 요약 입력 예산/파일당 제한

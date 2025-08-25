@@ -1482,6 +1482,11 @@ func (a *API) handleKnowledgePromoteAuto(w http.ResponseWriter, r *http.Request)
 	}
 	var b strings.Builder
 	budget := 4000
+	if v := os.Getenv("MYCODER_KP_BUDGET_BYTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			budget = n
+		}
+	}
 	for _, rel := range req.Files {
 		_, full, ok := a.resolveProjectPath(req.ProjectID, rel)
 		if !ok {
@@ -1497,8 +1502,13 @@ func (a *API) handleKnowledgePromoteAuto(w http.ResponseWriter, r *http.Request)
 		}
 		b.WriteString(header)
 		budget -= len(header)
-		// include up to 800 chars per file
+		// include up to max bytes per file
 		max := 800
+		if v := os.Getenv("MYCODER_KP_FILE_BYTES"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				max = n
+			}
+		}
 		if max > len(data) {
 			max = len(data)
 		}
@@ -2987,6 +2997,23 @@ func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []
 		}
 	}
 	avgLineBytes := 80 // heuristic; used to size maxLines per snippet
+	if v := os.Getenv("MYCODER_RAG_AVG_LINE_BYTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			avgLineBytes = n
+		}
+	}
+	minLines := 6
+	if v := os.Getenv("MYCODER_RAG_MIN_LINES_PER_SNIPPET"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			minLines = n
+		}
+	}
+	maxLinesCap := 24
+	if v := os.Getenv("MYCODER_RAG_MAX_LINES_CAP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxLinesCap = n
+		}
+	}
 	var root string
 	if p, ok := a.store.GetProject(projectID); ok {
 		root = p.RootPath
@@ -3005,14 +3032,14 @@ func (a *API) withRAGContext(messages []llm.Message, projectID string, k int) []
 		b.WriteString("\n")
 		if root != "" {
 			// dynamic maxLines based on remaining budget
-			maxLines := 24
+			maxLines := maxLinesCap
 			if avgLineBytes > 0 {
 				est := budget / avgLineBytes
 				if est < maxLines {
 					maxLines = est
 				}
-				if maxLines < 6 {
-					maxLines = 6
+				if maxLines < minLines {
+					maxLines = minLines
 				}
 			}
 			code := readSnippet(root, h.Path, h.StartLine, h.EndLine, maxLines)
@@ -3083,6 +3110,11 @@ func readSnippet(root, rel string, start, end, maxLines int) string {
 		end = start
 	}
 	margin := 2
+	if v := os.Getenv("MYCODER_RAG_SNIPPET_MARGIN_LINES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			margin = n
+		}
+	}
 	s := start - margin
 	if s < 1 {
 		s = 1

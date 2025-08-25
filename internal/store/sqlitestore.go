@@ -422,28 +422,35 @@ func (s *SQLiteStore) Search(projectID, query string, k int) []models.SearchResu
 	if k <= 0 {
 		k = 10
 	}
+	// preview token window configurable via env
+	prevTok := 10
+	if v := os.Getenv("MYCODER_PREVIEW_SNIPPET_TOKENS"); v != "" {
+		if n := atoiNoErr(v); n > 0 {
+			prevTok = n
+		}
+	}
 	var rows *sql.Rows
 	var err error
 	if projectID != "" {
-		rows, err = s.db.Query(`
-            SELECT d.path, bm25(termindex) as score, snippet(termindex, 2, '[', ']', ' … ', 10) as preview,
+		rows, err = s.db.Query(fmt.Sprintf(`
+            SELECT d.path, bm25(termindex) as score, snippet(termindex, 2, '[', ']', ' … ', %d) as preview,
                    c.start_line, c.end_line
             FROM termindex
             JOIN documents d ON d.id = termindex.doc_id
             JOIN chunks c ON c.doc_id = termindex.doc_id AND c.ord = termindex.ord
             WHERE d.project_id = ? AND termindex MATCH ?
             ORDER BY score DESC LIMIT ?
-        `, projectID, query, k)
+        `, prevTok), projectID, query, k)
 	} else {
-		rows, err = s.db.Query(`
-            SELECT d.path, bm25(termindex) as score, snippet(termindex, 2, '[', ']', ' … ', 10) as preview,
+		rows, err = s.db.Query(fmt.Sprintf(`
+            SELECT d.path, bm25(termindex) as score, snippet(termindex, 2, '[', ']', ' … ', %d) as preview,
                    c.start_line, c.end_line
             FROM termindex
             JOIN documents d ON d.id = termindex.doc_id
             JOIN chunks c ON c.doc_id = termindex.doc_id AND c.ord = termindex.ord
             WHERE termindex MATCH ?
             ORDER BY score DESC LIMIT ?
-        `, query, k)
+        `, prevTok), query, k)
 	}
 	if err != nil {
 		return nil

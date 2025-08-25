@@ -13,7 +13,10 @@
 - [x] 청킹을 토큰 기준 + 10~15% 오버랩으로 전환(코드 경계 우선)
 - [x] 하이브리드 가중치 α 재튜닝 및 리더보드 구성(k@5/10, MRR)
   - 테스트: `internal/rag/retriever/leaderboard_test.go` (α grid 평가 및 최고 α 선택)
-- [ ] 컨텍스트 예산/라인 스니펫 길이 튜닝(모델 컨텍스트 윈도우 확인 후 적용)
+- [x] 컨텍스트 예산/라인 스니펫 길이 튜닝(모델 컨텍스트 윈도우 확인 후 적용)
+  - 서버: `MYCODER_RAG_BUDGET_BYTES`, `MYCODER_RAG_AVG_LINE_BYTES`, `MYCODER_RAG_MIN_LINES_PER_SNIPPET`, `MYCODER_RAG_MAX_LINES_CAP`, `MYCODER_RAG_SNIPPET_MARGIN_LINES`
+  - FTS 미리보기: `MYCODER_PREVIEW_SNIPPET_TOKENS`
+  - Auto promote 요약: `MYCODER_KP_BUDGET_BYTES`, `MYCODER_KP_FILE_BYTES`
 - [ ] pgvector(Qdrant 대안) ANN 백엔드 실장 및 선택적 마이그레이션
 - [ ] 이웃 확장(함수/클래스 경계 기반) 적용
 - [ ] (선택) 크로스엔코더/LLM 재랭킹 상위 M 도입
